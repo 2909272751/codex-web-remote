@@ -21,19 +21,28 @@ foreach ($target in @($stageDirectory, $archivePath, $checksumPath)) {
     if (-not $resolved.StartsWith($distDirectory, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to remove a path outside dist: $resolved"
     }
+    if ((Get-Item -LiteralPath $resolved).PSIsContainer) { Get-ChildItem -LiteralPath $resolved -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object { $_.IsReadOnly = $false } }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
 
 $pnpm = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
-if (-not $pnpm) { throw "pnpm.cmd is required to build the release package." }
-& $pnpm.Source --config.node-linker=hoisted --filter codex-web-remote deploy --prod --legacy $deployDirectory
+$pnpmExe = if ($pnpm) { $pnpm.Source } else { $null }
+$pnpmPrefix = @()
+if (-not $pnpmExe) {
+    $pnpmExe = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
+    $pnpmCli = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules\pnpm\bin\pnpm.cjs"
+    if (-not (Test-Path -LiteralPath $pnpmExe) -or -not (Test-Path -LiteralPath $pnpmCli)) { throw "pnpm is required to build the release package." }
+    $pnpmPrefix = @($pnpmCli)
+}
+& $pnpmExe @pnpmPrefix --config.node-linker=hoisted --filter codex-web-remote deploy --prod --legacy $deployDirectory
 if ($LASTEXITCODE -ne 0) { throw "pnpm deploy failed with exit code $LASTEXITCODE" }
 $deployedModules = Join-Path $deployDirectory "node_modules"
 if (Test-Path -LiteralPath $deployedModules) {
+    Get-ChildItem -LiteralPath $deployedModules -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath $deployedModules -Recurse -Force
 }
 Copy-Item -LiteralPath (Join-Path $ProjectDirectory "pnpm-lock.yaml") -Destination (Join-Path $deployDirectory "pnpm-lock.yaml")
-& $pnpm.Source --dir $deployDirectory --config.node-linker=hoisted install --prod --frozen-lockfile
+& $pnpmExe @pnpmPrefix --dir $deployDirectory --config.node-linker=hoisted install --prod --frozen-lockfile
 if ($LASTEXITCODE -ne 0) { throw "pnpm install failed with exit code $LASTEXITCODE" }
 Move-Item -LiteralPath $deployDirectory -Destination $stageDirectory
 

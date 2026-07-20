@@ -12,7 +12,7 @@ import { buildServerRequestResponse } from "./src/server-request.mjs";
 import { TerminalSession } from "./src/terminal-session.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-loadEnvFile(path.join(root, ".env.local"));
+loadEnvFile(process.env.CODEX_WEB_ENV_FILE ? path.resolve(process.env.CODEX_WEB_ENV_FILE) : path.join(root, ".env.local"));
 
 const host = process.env.CODEX_WEB_HOST || "127.0.0.1";
 const port = Number(process.env.CODEX_WEB_PORT || 18888);

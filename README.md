@@ -1,135 +1,116 @@
 # Codex Web Remote
 
-在手机、平板或另一台电脑的浏览器中访问当前 Windows 电脑上的 Codex 任务。项目使用官方 Codex `app-server`/CLI 作为对话后端，并提供适配桌面、iPad 和手机的 Web 界面。
+在手机、iPad 或另一台电脑的浏览器中访问当前 Windows 电脑上的 Codex 任务。项目使用官方 Codex `app-server`/CLI 作为对话后端，并提供图形化安装器、Windows 托盘控制中心和响应式 PWA。
 
 > 这是社区项目，不是 OpenAI 官方产品。请勿把服务直接暴露到不可信网络。
 
 ## 主要功能
 
+- 双击 `Setup.exe` 安装，不要求用户安装 Node.js 或使用命令行
+- 原生首次设置界面和 Windows 托盘控制中心
 - 读取本机 Codex 历史任务并继续对话
-- 模型和推理强度切换、完全访问权限、审批与用户输入
+- 模型、推理强度、完全访问权限、审批与用户输入
 - 思考状态、计划、命令输出、文件变更、Diff 和工具进度
-- 引导消息、排队消息以及任务完成后自动继续队列
-- 上传文件、粘贴和预览图片
-- 使用量与额度重置时间显示
-- 独立 Edge/Playwright 浏览器工具：打开、读取、点击、填写与截图
-- 24 小时免重复登录、隐藏启动和 Windows 登录后自启动
-- 响应式布局，支持高分辨率电脑、iPad 和手机
+- 引导、排队以及任务完成后自动执行下一条消息
+- 文件上传、图片粘贴和预览
+- 使用量及额度重置时间
+- 独立 Edge/Playwright 浏览器工具
+- 24 小时免重复登录
+- PWA 主屏安装和手机、iPad、电脑响应式布局
 
-## 新电脑安装（推荐）
+## 新电脑安装
 
-### 1. 准备环境
+### 准备
 
-1. 使用 Windows 10/11 x64。
-2. 安装并登录 Codex Windows App，确认至少能正常打开一个任务。
-3. 确保 Microsoft Edge 已安装。
-4. 从 GitHub Releases 下载 `codex-web-remote-v1.0.0-windows-x64.zip`，不要下载自动生成的 Source code 压缩包。
+宿主电脑需要：
 
-Release 包已包含 Node.js、Codex CLI、Playwright MCP 和项目依赖，新电脑不需要安装 Node、npm 或 pnpm。
+- Windows 10/11 x64
+- 已安装并登录 Codex Windows App
+- Microsoft Edge
 
-### 2. 安装
+手机、平板或另一台电脑不需要安装 Codex App，也不需要登录 GPT，只需浏览器和 Web 密码。
 
-1. 将压缩包完整解压到固定目录，例如 `C:\Tools\codex-web-remote-v1.0.0-windows-x64`。
-2. 打开 PowerShell，进入解压后的目录。
-3. 运行：
+### 正式安装版（推荐）
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\setup.ps1
-```
+1. 打开 [GitHub Releases](https://github.com/2909272751/codex-web-remote/releases)。
+2. 下载 `CodexWebRemote-Setup-1.1.0-win-x64.exe`。
+3. 双击安装程序，按提示完成安装。
+4. 安装结束后会自动打开“Codex Web Remote”首次设置窗口。
+5. 输入至少 8 位的 Web 密码，可选填 88frp 公网地址。
+6. 点击“完成设置并启动”。
+7. 本机打开 [http://127.0.0.1:18888](http://127.0.0.1:18888)。
 
-4. 根据提示设置至少 8 位的 Web 密码。
-5. 安装脚本会创建 `Codex Web Remote` 登录自启动任务并启动服务。
-6. 在本机访问 [http://127.0.0.1:18888](http://127.0.0.1:18888)。
+安装完成后，程序会驻留在 Windows 托盘。可以随时启动、停止、重启服务，修改密码和端口，复制 88frp 配置或打开日志。
 
-密码只保存在本机 `.env.local`，该文件不会上传到 GitHub，也不会包含在 Release 包中。
+### 免安装版
 
-### 3. 配置 88frp
+1. 下载 `CodexWebRemote-Portable-1.1.0-win-x64.zip`。
+2. 完整解压到固定目录。
+3. 双击 `CodexWebRemote.exe`。
+4. 完成首次设置。
 
-在 88frp 新建 HTTP 或 HTTPS 隧道：
+不要直接在压缩包预览窗口中运行 EXE。
+
+## 88frp
+
+在 88frp 中新建 HTTP 或 HTTPS 隧道：
 
 ```text
 本地地址：127.0.0.1
 本地端口：18888
 ```
 
-之后通过 88frp 分配的公网地址访问。文件和图片上传也使用同一个端口。
+把 88frp 分配的公网地址填入托盘控制中心后，会生成供手机扫描的二维码。文件和图片上传使用同一个端口。
 
-强烈建议使用 HTTPS。若公网入口已经是 HTTPS，可将 `.env.local` 中的设置改为：
+建议使用 HTTPS，并在控制中心启用“公网入口使用 HTTPS”。HTTP 可以使用基本对话功能，但移动设备的 PWA、剪贴板和部分浏览器能力会受限制。
 
-```text
-CODEX_WEB_SECURE_COOKIE=1
-```
+## 手机和 iPad
 
-保存后在任务计划程序中重启 `Codex Web Remote`。
+- Android Chrome/Edge：浏览器菜单 →“添加到主屏幕”或“安装应用”。
+- iPhone/iPad Safari：分享按钮 →“添加到主屏幕”。
+- 支持横竖屏、软键盘安全区和触屏操作。
+
+PWA 安装通常需要 HTTPS 公网入口；普通网页访问不要求安装 PWA。
+
+## 安全和数据
+
+- Web 密码通过 Windows DPAPI 加密后保存在 `%LOCALAPPDATA%\CodexWebRemote\settings.json`。
+- 服务数据和浏览器工具资料保存在 `%LOCALAPPDATA%\CodexWebRemote\data`。
+- 上传文件保存在 `%USERPROFILE%\.codex\web-uploads`，默认保留七天。
+- 默认监听 `127.0.0.1`，不会直接监听所有网卡。
+- 默认拒绝上传 EXE、DLL、MSI、BAT、CMD、COM、SCR 和 PS1。
+- 卸载程序不会删除 Codex 原始任务和聊天记录，也不会主动删除用户设置。
 
 ## 日常使用
 
-- 桌面 App 正在执行任务时，Web 会提示稍后重试。
-- Web 取得控制权后，可以继续现有任务或创建新任务。
-- 不要在桌面 App 和 Web 可写模式中同时发送消息。
+- 桌面 Codex App 正在执行任务时，Web 会提示稍后重试。
+- Web 获得控制权后可以继续现有任务或创建新任务。
+- 不要同时从桌面 App 和 Web 可写模式发送消息。
 - Web 浏览器工具使用独立 Edge 配置，不共享桌面 Codex App 中 Browser 的标签页和登录状态。
-- 上传内容保存在 `%USERPROFILE%\.codex\web-uploads`，默认保留七天。
 
-## 手动启动和卸载自启动
+## 开发和构建
 
-前台启动，适合排错：
-
-```powershell
-.\start.ps1
-```
-
-重新安装自启动：
-
-```powershell
-.\install-autostart.ps1
-```
-
-移除自启动任务：
-
-```powershell
-.\uninstall-autostart.ps1
-```
-
-移除自启动不会删除项目、密码、Codex 任务或上传文件。
-
-## 从源码运行
-
-源码开发需要 Node.js 22+ 和 pnpm：
+源码开发需要 Node.js 22+、pnpm、.NET 8 SDK 和 Inno Setup 6：
 
 ```powershell
 pnpm install --frozen-lockfile
-.\start.ps1
+npm run check
+dotnet build .\desktop\CodexWebRemote.Launcher\CodexWebRemote.Launcher.csproj -c Release
+.\build-installer.ps1 -Version 1.1.0
 ```
 
-运行检查：
+安装器回归测试：
 
 ```powershell
-pnpm run check
-pnpm run test:requests
-pnpm run test:reasoning
-pnpm run test:browser-mcp
-pnpm run smoke
+.\scripts\installer-test.ps1 -SetupPath .\dist\CodexWebRemote-Setup-1.1.0-win-x64.exe
 ```
-
-构建便携发布包：
-
-```powershell
-.\build-release.ps1 -Version 1.0.0
-```
-
-## 安全说明
-
-- 服务带密码验证、失败限速、HttpOnly/SameSite Cookie，但它不是面向公共互联网设计的多用户系统。
-- 推荐把监听地址保持为 `127.0.0.1`，通过受控的 HTTPS 隧道访问。
-- 不要提交 `.env.local`、`.runtime-data`、Codex 登录文件或浏览器资料。
-- 默认拒绝上传 EXE、DLL、MSI、BAT、CMD、COM、SCR 和 PS1。
 
 ## 已知限制
 
-Windows 当前无法启动官方 `codex remote-control` app-server daemon，因此本项目使用独立 Playwright/Edge 后端提供浏览能力。它不是桌面 Codex App 中同一个 Browser 标签页。
-
-Codex `app-server` 协议可能随版本变化。升级 `@openai/codex` 后应重新运行全部测试。
+- 当前宿主安装包为 Windows x64；远程浏览器设备不受此架构限制。
+- Windows 当前无法启动官方 `codex remote-control` app-server daemon，因此浏览器能力由独立 Playwright/Edge 后端提供。
+- 未签名安装包首次运行时可能出现 Windows SmartScreen 提示。
+- Codex `app-server` 协议可能随版本变化，升级 `@openai/codex` 后需要重新运行测试。
 
 ## License
 
