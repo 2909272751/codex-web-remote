@@ -471,6 +471,10 @@ codex.on("notification", (data) => {
   broadcast({ type: "notification", data });
 });
 codex.on("serverRequest", handleServerRequest);
+codex.on("stderr", (chunk) => {
+  const message = String(chunk).trimEnd();
+  if (message) console.error(`[codex app-server] ${message}`);
+});
 codex.on("status", (data) => { broadcast({ type: "status", data }); if (data.ready && mode === "web") for (const threadId of Object.keys(queues)) scheduleQueue(threadId, 100); });
 
 async function processQueue(threadId) {

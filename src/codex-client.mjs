@@ -27,6 +27,7 @@ export class CodexClient extends EventEmitter {
 
   async start() {
     if (this.child) return;
+    this.stderrTail = [];
     const playwrightArgs = [
       playwrightMcpEntry,
       "--browser", "msedge",
@@ -41,8 +42,6 @@ export class CodexClient extends EventEmitter {
     const browserMcpConfig = enableBrowserMcp ? [
       "--disable", "apps",
       "--disable", "remote_plugin",
-      "-c", "mcp_servers.node_repl.enabled=false",
-      "-c", "mcp_servers.openaiDeveloperDocs.enabled=false",
       "-c", `mcp_servers.playwright.command=${JSON.stringify(process.execPath)}`,
       "-c", `mcp_servers.playwright.args=${JSON.stringify(playwrightArgs)}`,
       "-c", "mcp_servers.playwright.startup_timeout_sec=30",
@@ -57,7 +56,9 @@ export class CodexClient extends EventEmitter {
     });
 
     this.child.on("exit", (code, signal) => {
-      const error = new Error(`Codex app-server stopped (code=${code}, signal=${signal ?? "none"})`);
+      const stderr = this.stderrTail.slice(-12).join("\n").trim();
+      const detail = stderr ? `\n${stderr}` : "";
+      const error = new Error(`Codex app-server stopped (code=${code}, signal=${signal ?? "none"})${detail}`);
       for (const { reject } of this.pending.values()) reject(error);
       this.pending.clear();
       this.ready = false;
@@ -79,7 +80,7 @@ export class CodexClient extends EventEmitter {
       clientInfo: {
         name: "codex_web_remote",
         title: "Codex Web Remote",
-        version: "0.1.0",
+        version: "1.1.1",
       },
       capabilities: { experimentalApi: true },
     });
