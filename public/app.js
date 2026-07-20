@@ -17,7 +17,7 @@ import {
 } from "./timeline.js";
 
 const $ = (id) => document.getElementById(id);
-const state = { threads: [], models: [], current: null, currentSettings: null, threadStatus: null, tokenUsage: null, pendingThreadId: null, socket: null, socketConnected: false, reconnectTimer: null, activeTurnId: null, activity: null, control: null, attachments: [], queue: [], reasoningStreams: new Map(), usage: null, resetAttemptId: null, usageRefreshTimer: null, pendingRequests: [], lastEventSeq: 0, syncing: false, eventBacklog: [], reconnectCount: 0 };
+const state = { threads: [], models: [], current: null, currentSettings: null, threadStatus: null, tokenUsage: null, pendingThreadId: null, socket: null, socketConnected: false, reconnectTimer: null, activeTurnId: null, activity: null, control: null, attachments: [], queue: [], reasoningStreams: new Map(), usage: null, resetAttemptId: null, usageRefreshTimer: null, pendingRequests: [], lastEventSeq: 0, syncing: false, eventBacklog: [], reconnectCount: 0, update: null, updateLoaded: false };
 syncViewportHeight();
 window.addEventListener("resize", syncViewportHeight, { passive: true });
 window.addEventListener("orientationchange", syncViewportHeight, { passive: true });
@@ -39,6 +39,7 @@ $("usageMenuBtn").addEventListener("click", openUsage);
 $("usageCloseBtn").addEventListener("click", closeUsage);
 $("usageModal").addEventListener("click", (event) => { if (event.target === $("usageModal")) closeUsage(); });
 $("resetLimitBtn").addEventListener("click", resetRateLimit);
+$("updateNowBtn").addEventListener("click", applyHostUpdate);
 document.addEventListener("click", (event) => { if (!event.target.closest(".sidebar-footer")) closeAccountMenu(); });
 $("refreshBtn").addEventListener("click", () => state.control?.mode === "web" ? loadThreads() : loadThreadPreviews());
 $("search").addEventListener("input", renderThreads);
@@ -92,6 +93,41 @@ async function refreshControl() {
   if (state.control.mode === "web" && state.control.controller) await loadThreads();
   else await loadThreadPreviews();
   if (state.control.mode === "web" && !state.models.length) await loadModels().catch((error) => toast(`模型列表：${error.message}`));
+  if (!state.updateLoaded) await loadUpdateStatus();
+}
+
+async function loadUpdateStatus() {
+  state.updateLoaded = true;
+  try {
+    state.update = await api("/api/update/status");
+    const available = Boolean(state.update.updateAvailable);
+    $("updateBanner").classList.toggle("hidden", !available);
+    if (!available) return;
+    $("updateTitle").textContent = `发现新版本 v${state.update.latestVersion}`;
+    $("updateDetail").textContent = `当前 v${state.update.currentVersion}；更新会短暂重启服务，设置和数据都会保留。`;
+    $("updateReleaseLink").href = state.update.releaseUrl || "#";
+    $("updateNowBtn").disabled = !state.update.updaterAvailable || state.control?.mode !== "web";
+    $("updateNowBtn").textContent = state.update.updaterAvailable ? "立即更新" : "请在主机更新";
+  } catch (error) {
+    state.updateLoaded = false;
+  }
+}
+
+async function applyHostUpdate() {
+  if (!state.update?.updateAvailable) return;
+  if (!confirm(`更新到 v${state.update.latestVersion}？下载完成后服务会短暂断开并自动恢复。`)) return;
+  const button = $("updateNowBtn");
+  button.disabled = true;
+  button.textContent = "正在准备…";
+  try {
+    const result = await api("/api/update/apply", { method: "POST", body: {} });
+    $("updateDetail").textContent = result.message || "主机正在下载并校验更新，稍后会自动重启。";
+    toast("已通知主机更新，请保持页面打开，服务会自动重连");
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "立即更新";
+    toast(error.message);
+  }
 }
 
 function renderControl() {
@@ -106,6 +142,7 @@ function renderControl() {
   $("permissionShortcut").textContent = c.fullAccess ? "♧ 完全访问" : "♧ 标准权限";
   $("permissionShortcut").classList.toggle("enabled", Boolean(c.fullAccess));
   $("takeoverBtn").disabled = c.transition || c.controllerBusy;
+  if (state.update?.updateAvailable) $("updateNowBtn").disabled = !state.update.updaterAvailable || c.mode !== "web";
   const labels = { desktop: "桌面 App 正在使用；接管后会正常关闭桌面 App", available: "桌面 App 未运行，可以接管", web: "Web 共享控制已开启，可在多个设备同时使用" };
   $("controlText").textContent = c.transition ? (c.takeoverState?.message || "正在切换…") : (c.takeoverState?.phase === "failed" ? `接管失败：${c.takeoverState.message}` : (labels[c.mode] || c.mode));
   const canControl = c.mode === "web" && c.controller;
@@ -351,6 +388,7 @@ async function resyncAfterGap() {
 function handleEvent(event) {
   if (event.seq) state.lastEventSeq = Math.max(state.lastEventSeq, Number(event.seq));
   if (event.type === "control") return refreshControl().catch(() => {});
+  if (event.type === "hostUpdate") { $("updateBanner").classList.remove("hidden"); $("updateDetail").textContent = "主机正在准备更新，服务即将短暂重启…"; $("updateNowBtn").disabled = true; return; }
   if (event.type === "heartbeat") return;
   if (event.type === "activity" && state.current?.id === event.data.threadId) return setActivity(event.data.activity);
   if (event.type === "queue" && state.current?.id === event.data.threadId) { state.queue = event.data.items; return renderQueue(); }

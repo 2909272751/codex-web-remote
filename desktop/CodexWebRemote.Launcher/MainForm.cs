@@ -9,12 +9,20 @@ internal sealed class MainForm : Form
     private readonly AppPaths _paths;
     private readonly ConfigStore _config;
     private readonly ServerManager _server;
+    private readonly UpdateService _updates;
     private readonly bool _background;
     private readonly NotifyIcon _tray;
+    private readonly System.Windows.Forms.Timer _updateTimer = new() { Interval = 3000 };
     private readonly Panel _content = new() { Dock = DockStyle.Fill, AutoScroll = true };
     private Label? _statusTitle;
     private Label? _statusDetail;
     private Button? _startStop;
+    private Label? _updateStatus;
+    private Button? _updateButton;
+    private ReleaseInfo? _latestRelease;
+    private DateTime _lastUpdateCheck = DateTime.MinValue;
+    private bool _checkingUpdate;
+    private bool _applyingUpdate;
     private bool _allowExit;
     private bool _loaded;
 
@@ -26,7 +34,7 @@ internal sealed class MainForm : Form
 
     public MainForm(AppPaths paths, ConfigStore config, ServerManager server, bool background)
     {
-        _paths = paths; _config = config; _server = server; _background = background;
+        _paths = paths; _config = config; _server = server; _updates = new UpdateService(paths); _background = background;
         Text = "Codex Web Remote";
         Font = UiFont;
         BackColor = Color.FromArgb(250, 250, 252);
@@ -42,6 +50,7 @@ internal sealed class MainForm : Form
         menu.Items.Add("打开控制中心", null, (_, _) => SafeShow());
         menu.Items.Add("打开 Web 页面", null, (_, _) => OpenWeb());
         menu.Items.Add("重启服务", null, async (_, _) => await _server.RestartAsync());
+        menu.Items.Add("检查软件更新", null, async (_, _) => { SafeShow(); await CheckForUpdatesAsync(true); });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, async (_, _) => await ExitAsync());
         _tray = new NotifyIcon
@@ -53,6 +62,7 @@ internal sealed class MainForm : Form
         };
         _tray.DoubleClick += (_, _) => SafeShow();
         _server.Changed += ServerChanged;
+        _updateTimer.Tick += async (_, _) => await UpdateTimerTickAsync();
         Shown += OnFirstShown;
         FormClosing += OnFormClosing;
     }
@@ -75,6 +85,8 @@ internal sealed class MainForm : Form
             Opacity = 1;
         }
         await _server.StartAsync();
+        _updateTimer.Start();
+        await CheckForUpdatesAsync(false);
     }
 
     private void BuildSetupView()
@@ -121,6 +133,8 @@ internal sealed class MainForm : Form
             _config.Save(password.Box.Text, (int)port.Box.Value, false, autoStart.Checked, publicUrl.Box.Text);
             await _server.StartAsync();
             BuildDashboard();
+            _updateTimer.Start();
+            await CheckForUpdatesAsync(false);
         };
         page.Controls.Add(start);
         _content.Controls.Add(page);
@@ -155,6 +169,21 @@ internal sealed class MainForm : Form
         actions.Controls.AddRange([_startStop, restart, log]);
         statusCard.Controls.Add(_statusTitle); statusCard.Controls.Add(_statusDetail); statusCard.Controls.Add(actions);
         page.Controls.Add(statusCard);
+
+        var updateCard = Card();
+        updateCard.Controls.Add(SectionTitle("软件更新"));
+        _updateStatus = Body(_latestRelease is not null && _updates.IsNewer(_latestRelease)
+            ? $"发现新版本 {_latestRelease.TagName}，可一键安全更新。"
+            : $"当前版本 v{_updates.CurrentVersion.ToString(3)}");
+        _updateButton = SecondaryButton(_latestRelease is not null && _updates.IsNewer(_latestRelease) ? "立即更新" : "检查更新");
+        _updateButton.Click += async (_, _) =>
+        {
+            if (_latestRelease is not null && _updates.IsNewer(_latestRelease)) await ApplyUpdateAsync(_latestRelease, false);
+            else await CheckForUpdatesAsync(true);
+        };
+        updateCard.Controls.Add(_updateStatus);
+        updateCard.Controls.Add(_updateButton);
+        page.Controls.Add(updateCard);
 
         var connection = Card();
         connection.Controls.Add(SectionTitle("连接设备"));
@@ -224,6 +253,88 @@ internal sealed class MainForm : Form
         _statusDetail.Text = _server.Detail;
         _startStop.Text = running ? "停止服务" : "启动服务";
         _tray.Text = running ? "Codex Web Remote - 运行中" : "Codex Web Remote - 已停止";
+    }
+
+    private async Task CheckForUpdatesAsync(bool manual)
+    {
+        if (_checkingUpdate || _applyingUpdate) return;
+        _checkingUpdate = true;
+        if (_updateStatus is not null) _updateStatus.Text = "正在通过 GitHub 检查新版本…";
+        if (_updateButton is not null) _updateButton.Enabled = false;
+        try
+        {
+            _latestRelease = await _updates.CheckAsync();
+            _lastUpdateCheck = DateTime.UtcNow;
+            var available = _latestRelease is not null && _updates.IsNewer(_latestRelease);
+            if (_updateStatus is not null) _updateStatus.Text = available
+                ? $"发现新版本 {_latestRelease!.TagName}，更新时服务会短暂重启。"
+                : $"当前已是最新版 v{_updates.CurrentVersion.ToString(3)}";
+            if (_updateButton is not null) _updateButton.Text = available ? "立即更新" : "重新检查";
+            if (available)
+            {
+                Toast($"发现 Codex Web Remote {_latestRelease!.TagName}", 5000);
+                _tray.ShowBalloonTip(5000, "发现新版本", $"{_latestRelease.TagName} 已发布，可在控制中心一键更新。", ToolTipIcon.Info);
+            }
+            else if (manual) Toast("当前已是最新版");
+        }
+        catch (Exception ex)
+        {
+            if (_updateStatus is not null) _updateStatus.Text = $"检查失败：{ex.Message}";
+            if (manual) MessageBox.Show($"无法检查 GitHub 更新：{ex.Message}", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _checkingUpdate = false;
+            if (_updateButton is not null) _updateButton.Enabled = true;
+        }
+    }
+
+    private async Task UpdateTimerTickAsync()
+    {
+        if (_applyingUpdate || _checkingUpdate) return;
+        if (File.Exists(_paths.UpdateRequestFile))
+        {
+            try { File.Delete(_paths.UpdateRequestFile); } catch { return; }
+            await CheckForUpdatesAsync(false);
+            if (_latestRelease is not null && _updates.IsNewer(_latestRelease)) await ApplyUpdateAsync(_latestRelease, true);
+            return;
+        }
+        if (DateTime.UtcNow - _lastUpdateCheck > TimeSpan.FromHours(6)) await CheckForUpdatesAsync(false);
+    }
+
+    private async Task ApplyUpdateAsync(ReleaseInfo release, bool remoteRequested)
+    {
+        if (_applyingUpdate) return;
+        if (!remoteRequested && MessageBox.Show($"将更新到 {release.TagName}。服务会短暂断开并自动重启，是否继续？", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        _applyingUpdate = true;
+        if (_updateButton is not null) _updateButton.Enabled = false;
+        try
+        {
+            var progress = new Progress<int>(value =>
+            {
+                if (_updateStatus is not null) _updateStatus.Text = $"正在下载并校验 {release.TagName}… {value}%";
+            });
+            var prepared = await _updates.DownloadAsync(release, progress);
+            if (_updateStatus is not null) _updateStatus.Text = "更新包校验通过，正在重启安装…";
+            var helper = new ProcessStartInfo(prepared.HelperPath) { UseShellExecute = true };
+            helper.ArgumentList.Add("--apply-update");
+            helper.ArgumentList.Add(prepared.SetupPath);
+            helper.ArgumentList.Add(_paths.AppRoot);
+            helper.ArgumentList.Add(Environment.ProcessId.ToString());
+            Process.Start(helper);
+            _allowExit = true;
+            _updateTimer.Stop();
+            await _server.StopAsync();
+            _tray.Visible = false;
+            Application.Exit();
+        }
+        catch (Exception ex)
+        {
+            _applyingUpdate = false;
+            if (_updateButton is not null) _updateButton.Enabled = true;
+            if (_updateStatus is not null) _updateStatus.Text = $"更新失败：{ex.Message}";
+            MessageBox.Show(ex.Message, "更新失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     public void SafeShow()
@@ -351,7 +462,7 @@ internal sealed class MainForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { _server.Changed -= ServerChanged; _tray.Dispose(); UiFont.Dispose(); }
+        if (disposing) { _server.Changed -= ServerChanged; _updateTimer.Dispose(); _updates.Dispose(); _tray.Dispose(); UiFont.Dispose(); }
         base.Dispose(disposing);
     }
 }

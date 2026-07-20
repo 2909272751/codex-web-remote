@@ -11,6 +11,14 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        var applyIndex = Array.FindIndex(args, value => value.Equals("--apply-update", StringComparison.OrdinalIgnoreCase));
+        if (applyIndex >= 0 && args.Length >= applyIndex + 4)
+        {
+            Environment.ExitCode = int.TryParse(args[applyIndex + 3], out var parentPid)
+                ? UpdateApplier.Run(args[applyIndex + 1], args[applyIndex + 2], parentPid)
+                : 1;
+            return;
+        }
         if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase))
         {
             Environment.ExitCode = RunSelfTest();
@@ -61,11 +69,12 @@ internal static class Program
             var paths = new AppPaths();
             var config = new ConfigStore(paths);
             var port = int.TryParse(Environment.GetEnvironmentVariable("CODEX_WEB_SELF_TEST_PORT"), out var parsed) ? parsed : 18992;
-            config.Save("codex-web-self-test", port, false, false);
+            config.Save("codex-web-self-test", port, false, false, applyAutoStart: false);
             using var server = new ServerManager(paths, config);
             if (!server.StartAsync().GetAwaiter().GetResult()) return 2;
             if (!server.IsHealthyAsync(port).GetAwaiter().GetResult()) return 3;
             server.StopAsync().GetAwaiter().GetResult();
+            if (!UpdateService.TryParseVersion("v99.8.7", out var updateVersion) || updateVersion != new Version(99, 8, 7)) return 4;
             return 0;
         }
         catch { return 1; }

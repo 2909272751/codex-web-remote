@@ -23,6 +23,9 @@ const dataDir = process.env.CODEX_WEB_DATA_DIR ? path.resolve(process.env.CODEX_
 const queueFile = path.join(dataDir, "queues.json");
 const threadCacheFile = path.join(dataDir, "threads.json");
 const sessionFile = path.join(dataDir, "sessions.json");
+const updateRequestFile = process.env.CODEX_WEB_UPDATE_REQUEST_FILE ? path.resolve(process.env.CODEX_WEB_UPDATE_REQUEST_FILE) : "";
+const updateApiUrl = process.env.CODEX_WEB_UPDATE_API || "https://api.github.com/repos/2909272751/codex-web-remote/releases/latest";
+const currentVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0";
 const sessionIndexFile = path.join(process.env.USERPROFILE || root, ".codex", "session_index.jsonl");
 const sessionRoot = path.join(process.env.USERPROFILE || root, ".codex", "sessions");
 const uploadDir = process.env.CODEX_WEB_UPLOAD_DIR ? path.resolve(process.env.CODEX_WEB_UPLOAD_DIR) : path.join(process.env.USERPROFILE || root, ".codex", "web-uploads");
@@ -70,6 +73,7 @@ let transition = false;
 let takeoverState = { phase: "idle", message: "", startedAt: 0, updatedAt: Date.now(), processes: [] };
 let lastThreadId = null;
 let resetCreditInFlight = false;
+let updateCache = null;
 let eventSeq = 0;
 const eventBuffer = [];
 const eventBufferLimit = 1_000;
@@ -213,6 +217,23 @@ app.post("/api/control/full-access", requireAuth, requireController, requireSame
 });
 
 app.get("/api/status", requireAuth, (req, res) => res.json({ ready: codex.ready, mode, stderr: codex.stderrTail.slice(-10) }));
+
+app.get("/api/update/status", requireAuth, asyncRoute(async (req, res) => {
+  const release = await latestRelease(false);
+  res.json({ currentVersion, ...release, updaterAvailable: Boolean(updateRequestFile) });
+}));
+
+app.post("/api/update/apply", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  if (!updateRequestFile) return res.status(409).json({ error: "当前不是 EXE 托盘版，无法一键更新" });
+  if (activeTurns.size || threadSubmissions.size) return res.status(409).json({ error: "仍有任务正在运行或启动，请完成后再更新" });
+  const queued = Object.values(queues).reduce((sum, list) => sum + list.length, 0);
+  if (queued) return res.status(409).json({ error: `还有 ${queued} 条排队消息，请处理后再更新` });
+  const release = await latestRelease(true);
+  if (!release.updateAvailable) return res.status(409).json({ error: "当前已是最新版" });
+  await atomicJson(updateRequestFile, { requestedAt: Date.now(), tagName: release.latestVersion });
+  broadcast({ type: "hostUpdate", data: { phase: "requested", version: release.latestVersion } });
+  res.status(202).json({ ok: true, version: release.latestVersion, message: "主机正在下载更新，服务稍后会自动重启" });
+}));
 
 app.get("/api/threads", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
   const result = await codex.request("thread/list", {
@@ -835,6 +856,38 @@ async function launchDesktop(threadId) {
 
 function runPowerShell(script) {
   return new Promise((resolve, reject) => execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+}
+
+async function latestRelease(force = false) {
+  if (!force && updateCache && Date.now() - updateCache.checkedAt < 6 * 3600_000) return updateCache.value;
+  const response = await fetch(updateApiUrl, {
+    headers: { Accept: "application/vnd.github+json", "User-Agent": `CodexWebRemote/${currentVersion}` },
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (!response.ok) throw new Error(`GitHub 更新检查失败：HTTP ${response.status}`);
+  const data = await response.json();
+  const latestVersion = String(data.tag_name || "").replace(/^v/i, "");
+  const assets = Array.isArray(data.assets) ? data.assets : [];
+  const hasSetup = assets.some((asset) => /CodexWebRemote-Setup-.*-win-x64\.exe$/i.test(String(asset.name || "")));
+  const hasHash = assets.some((asset) => /CodexWebRemote-Setup-.*-win-x64\.exe\.sha256$/i.test(String(asset.name || "")));
+  const value = {
+    latestVersion,
+    releaseUrl: String(data.html_url || ""),
+    publishedAt: data.published_at || null,
+    updateAvailable: !data.draft && !data.prerelease && hasSetup && hasHash && compareVersions(latestVersion, currentVersion) > 0,
+  };
+  updateCache = { checkedAt: Date.now(), value };
+  return value;
+}
+
+function compareVersions(left, right) {
+  const parse = (value) => String(value || "0").replace(/^v/i, "").split(/[+-]/)[0].split(".").map((part) => Number(part) || 0);
+  const a = parse(left), b = parse(right);
+  for (let index = 0; index < Math.max(a.length, b.length); index++) {
+    const difference = (a[index] || 0) - (b[index] || 0);
+    if (difference) return Math.sign(difference);
+  }
+  return 0;
 }
 
 function getSession(req) {

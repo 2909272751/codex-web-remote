@@ -18,6 +18,7 @@
 - 独立 Edge/Playwright 浏览器工具
 - 24 小时免重复登录
 - PWA 主屏安装和手机、iPad、电脑响应式布局
+- 通过 GitHub 自动检测新版本；托盘或远程 Web 可一键下载、校验、覆盖安装并自动重启
 
 ## 新电脑安装
 
@@ -34,7 +35,7 @@
 ### 正式安装版（推荐）
 
 1. 打开 [GitHub Releases](https://github.com/2909272751/codex-web-remote/releases)。
-2. 下载 `CodexWebRemote-Setup-1.2.0-win-x64.exe`。
+2. 下载 `CodexWebRemote-Setup-1.3.0-win-x64.exe`。
 3. 双击安装程序，按提示完成安装。
 4. 安装结束后会自动打开“Codex Web Remote”首次设置窗口。
 5. 输入至少 8 位的 Web 密码，可选填 88frp 公网地址。
@@ -45,7 +46,7 @@
 
 ### 免安装版
 
-1. 下载 `CodexWebRemote-Portable-1.2.0-win-x64.zip`。
+1. 下载 `CodexWebRemote-Portable-1.3.0-win-x64.zip`。
 2. 完整解压到固定目录。
 3. 双击 `CodexWebRemote.exe`。
 4. 完成首次设置。
@@ -73,6 +74,14 @@
 
 PWA 安装通常需要 HTTPS 公网入口；普通网页访问不要求安装 PWA。
 
+## 软件更新
+
+- 托盘控制中心每 6 小时通过 GitHub Releases 检查一次，也可以手动点击“检查软件更新”。
+- 远程 Web 检测到新版本后会显示更新横幅；没有运行中任务和排队消息时，可以直接点击“立即更新”。
+- 更新包和 `.sha256` 都从本项目 GitHub Release 下载，校验通过后才会安装。
+- 更新会停止服务、覆盖当前安装目录并自动重启，通常只短暂断线；密码、端口、自启、88frp 和数据目录不会变化。
+- 便携版能够提示新版本，但只有由 EXE 托盘启动的网关支持远程一键更新。
+
 ## 安全和数据
 
 - Web 密码通过 Windows DPAPI 加密后保存在 `%LOCALAPPDATA%\CodexWebRemote\settings.json`。
@@ -97,13 +106,13 @@ PWA 安装通常需要 HTTPS 公网入口；普通网页访问不要求安装 PW
 pnpm install --frozen-lockfile
 npm run check
 dotnet build .\desktop\CodexWebRemote.Launcher\CodexWebRemote.Launcher.csproj -c Release
-.\build-installer.ps1 -Version 1.2.0
+.\build-installer.ps1 -Version 1.3.0
 ```
 
 安装器回归测试：
 
 ```powershell
-.\scripts\installer-test.ps1 -SetupPath .\dist\CodexWebRemote-Setup-1.2.0-win-x64.exe
+.\scripts\installer-test.ps1 -SetupPath .\dist\CodexWebRemote-Setup-1.3.0-win-x64.exe
 ```
 
 ## 已知限制

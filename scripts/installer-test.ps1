@@ -10,6 +10,7 @@ New-Item -ItemType Directory -Path $qaRoot, $state | Out-Null
 if (-not $qaRoot.StartsWith($env:TEMP, [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe QA root: $qaRoot" }
 
 $taskBefore = (Get-ScheduledTask -TaskName "Codex Web Remote" -ErrorAction SilentlyContinue).State
+$runBefore = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue).'Codex Web Remote'
 $installerArgs = @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/QA=1", "/DIR=$install")
 $installer = Start-Process -FilePath $SetupPath -ArgumentList $installerArgs -WindowStyle Hidden -PassThru -Wait
 if ($installer.ExitCode -ne 0) { throw "Installer failed: $($installer.ExitCode)" }
@@ -32,7 +33,7 @@ if ($uninstaller.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstaller.Exi
 Start-Sleep -Seconds 2
 
 $taskAfter = (Get-ScheduledTask -TaskName "Codex Web Remote" -ErrorAction SilentlyContinue).State
-$production = Invoke-WebRequest "http://127.0.0.1:18888/api/session" -UseBasicParsing -TimeoutSec 10
+$runAfter = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue).'Codex Web Remote'
 [pscustomobject]@{
     QaRoot = $qaRoot
     InstallerExit = $installer.ExitCode
@@ -42,5 +43,5 @@ $production = Invoke-WebRequest "http://127.0.0.1:18888/api/session" -UseBasicPa
     SettingsPreserved = Test-Path -LiteralPath (Join-Path $state "settings.json")
     TaskBefore = $taskBefore
     TaskAfter = $taskAfter
-    ProductionHttp = $production.StatusCode
+    AutoStartPreserved = $runBefore -eq $runAfter
 }
