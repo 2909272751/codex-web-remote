@@ -603,3 +603,7 @@ function formatDate(value) { if (!value) return ""; const date = new Date(typeof
 function scrollBottom() { requestAnimationFrame(() => { $("messages").scrollTop = $("messages").scrollHeight; }); }
 function autoSize() { const input = $("messageInput"); input.style.height = "auto"; input.style.height = `${Math.min(180, input.scrollHeight)}px`; }
 let toastTimer; function toast(text) { clearTimeout(toastTimer); $("toast").textContent = text; $("toast").classList.remove("hidden"); toastTimer = setTimeout(() => $("toast").classList.add("hidden"), 4500); }
+
+if ("serviceWorker" in navigator && (location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname))) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+}

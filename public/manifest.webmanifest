@@ -1,0 +1,15 @@
+{
+  "name": "Codex Web Remote",
+  "short_name": "Codex Remote",
+  "description": "从手机、平板和电脑安全访问 Windows 上的 Codex 任务",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f7f7fb",
+  "theme_color": "#7650f5",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

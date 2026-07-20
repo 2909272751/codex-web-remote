@@ -9,8 +9,9 @@ const projectRoot = path.resolve(here, "..");
 const codexEntry = path.join(projectRoot, "node_modules", "@openai", "codex", "bin", "codex.js");
 const codexProfile = process.env.CODEX_WEB_CODEX_PROFILE || "";
 const playwrightMcpEntry = path.join(projectRoot, "node_modules", "@playwright", "mcp", "cli.js");
-const playwrightOutputDir = path.join(projectRoot, ".runtime-data", "playwright-output");
-const playwrightProfileDir = path.join(projectRoot, ".runtime-data", "playwright-profile");
+const runtimeDataRoot = process.env.CODEX_WEB_DATA_DIR ? path.resolve(process.env.CODEX_WEB_DATA_DIR) : path.join(projectRoot, ".runtime-data");
+const playwrightOutputDir = path.join(runtimeDataRoot, "playwright-output");
+const playwrightProfileDir = path.join(runtimeDataRoot, "playwright-profile");
 const enableBrowserMcp = process.env.CODEX_WEB_BROWSER_MCP !== "0";
 
 export class CodexClient extends EventEmitter {
