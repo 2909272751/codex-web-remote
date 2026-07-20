@@ -106,7 +106,7 @@ function renderControl() {
   $("permissionShortcut").textContent = c.fullAccess ? "♧ 完全访问" : "♧ 标准权限";
   $("permissionShortcut").classList.toggle("enabled", Boolean(c.fullAccess));
   $("takeoverBtn").disabled = c.transition || c.controllerBusy;
-  const labels = { desktop: "桌面 App 正在使用；接管后会正常关闭桌面 App", available: "桌面 App 未运行，可以接管", web: c.controller ? "Web 已独占接管" : "另一浏览器正在控制" };
+  const labels = { desktop: "桌面 App 正在使用；接管后会正常关闭桌面 App", available: "桌面 App 未运行，可以接管", web: "Web 共享控制已开启，可在多个设备同时使用" };
   $("controlText").textContent = c.transition ? (c.takeoverState?.message || "正在切换…") : (c.takeoverState?.phase === "failed" ? `接管失败：${c.takeoverState.message}` : (labels[c.mode] || c.mode));
   const canControl = c.mode === "web" && c.controller;
   for (const id of ["messageInput", "sendMode", "attachBtn"]) $(id).disabled = !canControl || !state.current;

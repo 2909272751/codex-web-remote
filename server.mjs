@@ -60,9 +60,10 @@ const pendingApprovals = new Map();
 const readonlyThreadCache = new Map();
 const queueWorkers = new Set();
 const queueRetryTimers = new Map();
+const threadSubmissions = new Set();
 const codex = new CodexClient();
 const terminal = new TerminalSession();
-let controllerToken = null;
+let terminalControllerToken = null;
 let fullAccess = defaultFullAccess;
 let mode = "desktop";
 let transition = false;
@@ -105,7 +106,7 @@ app.post("/api/login", asyncRoute(async (req, res) => {
 }));
 
 app.post("/api/logout", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
-  if (controllerToken === req.sessionToken) { controllerToken = null; broadcastState(); }
+  if (terminalControllerToken === req.sessionToken) { terminalControllerToken = null; broadcastState(); }
   sessions.delete(sessionKey(req.sessionToken));
   await saveSessions();
   res.setHeader("Set-Cookie", cookieHeader("", 0));
@@ -121,8 +122,9 @@ app.get("/api/control/status", requireAuth, asyncRoute(async (req, res) => {
   const desktop = await inspectDesktopProcesses();
   res.json({
     mode, transition, takeoverState, fullAccess, terminal: terminal.status(), desktopRunning: desktop.running, desktopProcesses: desktop.processes, codexReady: codex.ready,
-    controller: controllerToken === req.sessionToken,
-    controllerBusy: Boolean(controllerToken && controllerToken !== req.sessionToken),
+    controller: mode === "web" || (mode === "terminal" && terminalControllerToken === req.sessionToken),
+    controllerBusy: mode === "terminal" && Boolean(terminalControllerToken && terminalControllerToken !== req.sessionToken),
+    sharedWebControl: mode === "web",
     activeTurns: Object.fromEntries(activeTurns),
     activities: Object.fromEntries(threadActivities),
     threadStatuses: Object.fromEntries(threadStatuses),
@@ -139,14 +141,7 @@ app.get("/api/control/status", requireAuth, asyncRoute(async (req, res) => {
 
 app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
   if (transition) return res.status(409).json({ error: "正在切换状态" });
-  if (controllerToken && !isSessionTokenActive(controllerToken)) controllerToken = null;
-  if (controllerToken && controllerToken !== req.sessionToken) return res.status(409).json({ error: "另一个浏览器正在控制" });
-  if (mode === "web" && codex.ready && !controllerToken) {
-    controllerToken = req.sessionToken;
-    broadcastState();
-    return res.json({ ok: true, reclaimed: true });
-  }
-  if (mode === "web" && codex.ready && controllerToken === req.sessionToken) return res.json({ ok: true, alreadyControlled: true });
+  if (mode === "web" && codex.ready) return res.json({ ok: true, alreadyControlled: true, shared: true });
   transition = true; setTakeoverState("checking", "正在检查桌面 Codex");
   try {
     const desktop = await inspectDesktopProcesses();
@@ -161,7 +156,7 @@ app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(asy
     setTakeoverState("verifying", "正在验证任务列表");
     const probe = await codex.request("thread/list", { limit: 1, sortKey: "recency_at", sortDirection: "desc", archived: false, modelProviders: [], sourceKinds: null });
     if (!probe || !Array.isArray(probe.data)) throw new Error("Codex 后端健康检查失败");
-    controllerToken = req.sessionToken;
+    terminalControllerToken = null;
     mode = "web";
     setTakeoverState("ready", "接管成功");
     res.json({ ok: true });
@@ -174,7 +169,7 @@ app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(asy
 
 app.post("/api/control/release", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
   if (transition) return res.status(409).json({ error: "正在切换状态" });
-  if (mode === "web" && activeTurns.size) return res.status(409).json({ error: "仍有任务正在运行，请等待或中断" });
+  if (mode === "web" && (activeTurns.size || threadSubmissions.size)) return res.status(409).json({ error: "仍有任务正在运行或启动，请等待或中断" });
   const queued = Object.values(queues).reduce((sum, list) => sum + list.length, 0);
   if (queued && !req.body?.discardQueue) return res.status(409).json({ error: `还有 ${queued} 条排队消息` });
   transition = true; broadcastState();
@@ -183,7 +178,7 @@ app.post("/api/control/release", requireAuth, requireController, requireSameOrig
     if (mode === "terminal") terminal.stop(); else await codex.stop();
     fullAccess = defaultFullAccess;
     mode = "desktop";
-    controllerToken = null;
+    terminalControllerToken = null;
     await launchDesktop(String(req.body?.threadId || lastThreadId || ""));
     res.json({ ok: true });
   } finally { transition = false; broadcastState(); }
@@ -191,7 +186,8 @@ app.post("/api/control/release", requireAuth, requireController, requireSameOrig
 
 app.post("/api/terminal/start", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
   if (transition) return res.status(409).json({ error: "正在切换状态" });
-  if (controllerToken && controllerToken !== req.sessionToken) return res.status(409).json({ error: "另一个浏览器正在控制" });
+  if (terminalControllerToken && !isSessionTokenActive(terminalControllerToken)) terminalControllerToken = null;
+  if (mode === "terminal" && terminalControllerToken && terminalControllerToken !== req.sessionToken) return res.status(409).json({ error: "另一个浏览器正在使用终端" });
   transition = true; setTakeoverState("checking", "正在检查桌面 Codex");
   try {
     const desktop = await inspectDesktopProcesses();
@@ -201,7 +197,7 @@ app.post("/api/terminal/start", requireAuth, requireSameOrigin, asyncRoute(async
     if (codex.ready) await codex.stop();
     activeTurns.clear(); threadActivities.clear();
     setTakeoverState("starting", "正在启动官方 Codex CLI");
-    controllerToken = req.sessionToken; mode = "terminal";
+    terminalControllerToken = req.sessionToken; mode = "terminal";
     const selected = (await readThreadPreviews()).find((item) => item.id === String(req.body?.threadId || ""));
     terminal.start({ threadId: selected?.id || "", cwd: selected?.cwd || root, cols: Number(req.body?.cols || 120), rows: Number(req.body?.rows || 34) });
     setTakeoverState("ready", "Codex CLI 已连接"); res.json({ ok: true, terminal: terminal.status() });
@@ -293,9 +289,10 @@ app.post("/api/threads/:id/messages", requireAuth, requireController, requireSam
   if (!input.length) return res.status(400).json({ error: "消息或附件不能为空" });
   const threadId = req.params.id;
   const activeTurnId = activeTurns.get(threadId);
+  const submissionPending = threadSubmissions.has(threadId);
   lastThreadId = threadId;
 
-  if (modeRequested === "queue" || (modeRequested === "auto" && activeTurnId)) {
+  if (modeRequested === "queue" || (modeRequested === "auto" && (activeTurnId || submissionPending))) {
     const item = { id: crypto.randomUUID(), text, input, createdAt: Date.now(), settings: turnOverrides(req.body) };
     (queues[threadId] ||= []).push(item); await saveQueues(); broadcastQueue(threadId);
     if (!activeTurnId) scheduleQueue(threadId, 50);
@@ -307,10 +304,16 @@ app.post("/api/threads/:id/messages", requireAuth, requireController, requireSam
       threadId, expectedTurnId: activeTurnId, input, clientUserMessageId: crypto.randomUUID(),
     }));
   }
-  await resumeThread(threadId);
-  const result = await codex.request("turn/start", { threadId, input, clientUserMessageId: crypto.randomUUID(), ...turnOverrides(req.body), ...turnPermissionOverrides() });
-  if (result.turn?.id) activeTurns.set(threadId, result.turn.id);
-  res.json(result);
+  threadSubmissions.add(threadId);
+  try {
+    await resumeThread(threadId);
+    const result = await codex.request("turn/start", { threadId, input, clientUserMessageId: crypto.randomUUID(), ...turnOverrides(req.body), ...turnPermissionOverrides() });
+    if (result.turn?.id) activeTurns.set(threadId, result.turn.id);
+    res.json(result);
+  } finally {
+    threadSubmissions.delete(threadId);
+    if (!activeTurns.has(threadId) && queues[threadId]?.length) scheduleQueue(threadId, 50);
+  }
 }));
 
 app.post("/api/threads/:id/interrupt", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -429,7 +432,7 @@ wss.on("connection", (ws, req) => {
   if (replayAvailable && since > 0) for (const event of eventBuffer) if (event.seq > since && ws.readyState === 1) ws.send(JSON.stringify(event));
   ws.on("close", () => sockets.delete(ws));
 });
-terminalWss.on("connection", (ws, req) => { if (controllerToken !== req.sessionToken || mode !== "terminal") return ws.close(1008, "No terminal control"); if (terminal.buffer) ws.send(JSON.stringify({ type: "data", data: terminal.buffer })); ws.send(JSON.stringify({ type: "status", data: terminal.status() })); ws.on("message", (raw) => { try { const message = JSON.parse(String(raw)); if (message.type === "input") terminal.write(message.data); if (message.type === "resize") terminal.resize(Number(message.cols), Number(message.rows)); } catch { } }); });
+terminalWss.on("connection", (ws, req) => { if (terminalControllerToken !== req.sessionToken || mode !== "terminal") return ws.close(1008, "No terminal control"); if (terminal.buffer) ws.send(JSON.stringify({ type: "data", data: terminal.buffer })); ws.send(JSON.stringify({ type: "status", data: terminal.status() })); ws.on("message", (raw) => { try { const message = JSON.parse(String(raw)); if (message.type === "input") terminal.write(message.data); if (message.type === "resize") terminal.resize(Number(message.cols), Number(message.rows)); } catch { } }); });
 terminal.on("data", (data) => { const body = JSON.stringify({ type: "data", data }); for (const ws of terminalWss.clients) if (ws.readyState === 1) ws.send(body); });
 terminal.on("exit", (data) => { const body = JSON.stringify({ type: "exit", data }); for (const ws of terminalWss.clients) if (ws.readyState === 1) ws.send(body); });
 
@@ -478,8 +481,9 @@ codex.on("stderr", (chunk) => {
 codex.on("status", (data) => { broadcast({ type: "status", data }); if (data.ready && mode === "web") for (const threadId of Object.keys(queues)) scheduleQueue(threadId, 100); });
 
 async function processQueue(threadId) {
-  if (queueWorkers.has(threadId) || mode !== "web" || !codex.ready || !(queues[threadId]?.length)) return;
+  if (queueWorkers.has(threadId) || threadSubmissions.has(threadId) || mode !== "web" || !codex.ready || !(queues[threadId]?.length)) return;
   queueWorkers.add(threadId);
+  threadSubmissions.add(threadId);
   const item = queues[threadId][0];
   try {
     if (activeTurns.has(threadId)) {
@@ -503,6 +507,7 @@ async function processQueue(threadId) {
     scheduleQueue(threadId, 2500);
   } finally {
     queueWorkers.delete(threadId);
+    threadSubmissions.delete(threadId);
   }
 }
 
@@ -844,7 +849,11 @@ function isSessionTokenActive(token) {
 }
 function requireAuth(req, res, next) { if (!getSession(req)) return res.status(401).json({ error: "未登录" }); next(); }
 function requireWebMode(req, res, next) { if (mode !== "web" || !codex.ready) return res.status(409).json({ error: "请先接管 Codex" }); next(); }
-function requireController(req, res, next) { if (!new Set(["web", "terminal"]).has(mode) || controllerToken !== req.sessionToken) return res.status(409).json({ error: "当前浏览器没有控制权" }); next(); }
+function requireController(req, res, next) {
+  if (mode === "web" && codex.ready) return next();
+  if (mode === "terminal" && terminalControllerToken === req.sessionToken) return next();
+  return res.status(409).json({ error: "当前浏览器没有控制权" });
+}
 function requireSameOrigin(req, res, next) {
   const origin = req.headers.origin; const expectedHost = req.headers["x-forwarded-host"] || req.headers.host;
   if (origin) { try { if (new URL(origin).host !== expectedHost) return res.status(403).json({ error: "来源校验失败" }); } catch { return res.status(403).json({ error: "来源校验失败" }); } }
