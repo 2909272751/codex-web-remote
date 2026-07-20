@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f7f7fb">
+  <meta name="color-scheme" content="light">
+  <title>Codex Remote</title>
+  <link rel="stylesheet" href="/styles.css?v=20260720-1700">
+  <link rel="stylesheet" href="/layout-fix.css?v=20260720-1700">
+</head>
+<body>
+  <section id="loginView" class="center-card hidden">
+    <form id="loginForm" class="login-card">
+      <div class="logo">C</div><span class="eyebrow">PRIVATE AI WORKSPACE</span>
+      <h1>欢迎回来</h1><p>安全连接到这台电脑上的 Codex</p>
+      <label>访问密码<input id="password" type="password" autocomplete="current-password" minlength="8" required autofocus placeholder="输入访问密码"></label>
+      <button type="submit">进入工作区 <span>→</span></button><div id="loginError" class="error"></div>
+    </form>
+  </section>
+
+  <main id="appView" class="app hidden">
+    <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+    <aside id="sidebar" class="sidebar">
+      <header><div class="brand-mark">C</div><strong>Codex <em>Remote</em></strong><span id="statusDot" class="dot"></span><button id="sidebarCloseBtn" class="sidebar-close" aria-label="关闭任务列表">×</button></header>
+      <div class="sidebar-actions"><button id="newThreadBtn" class="nav-action"><span>＋</span> 新建任务</button></div>
+      <div class="toolbar"><span>⌕</span><input id="search" type="search" placeholder="搜索任务"></div>
+      <div class="section-label">最近任务</div>
+      <nav id="threadList" class="thread-list"></nav>
+      <footer class="sidebar-footer">
+        <button id="accountMenuBtn" class="account-button" type="button" aria-haspopup="menu" aria-expanded="false"><span class="account-chip">AW</span><span>我的 Codex</span><span class="account-chevron">⌃</span></button>
+        <button id="refreshBtn" class="ghost" title="刷新">↻</button>
+        <div id="accountMenu" class="account-menu hidden" role="menu">
+          <div class="account-menu-head"><span class="account-chip">AW</span><strong>我的 Codex</strong></div>
+          <button id="usageMenuBtn" type="button" role="menuitem"><span>◴</span> 使用情况</button>
+          <button id="logoutBtn" type="button" role="menuitem"><span>↪</span> 退出登录</button>
+        </div>
+      </footer>
+    </aside>
+
+    <section class="chat-shell">
+      <div id="controlBar" class="control-bar"><span class="control-spark">✦</span><span id="controlText">正在检查状态…</span><div class="control-actions"><button id="fullAccessBtn" class="full-access hidden">完全访问</button><button id="takeoverBtn">接管 Codex</button><button id="releaseBtn" class="hidden">释放到桌面 App</button></div></div>
+      <header class="chat-header">
+        <button id="menuBtn" class="icon-button" aria-label="打开任务列表">☰</button>
+        <div class="chat-heading"><h2 id="chatTitle">选择一个任务</h2><small id="chatMeta">从任务列表开始，或创建新任务</small></div>
+        <span id="activityStatus" class="activity hidden"><i></i><span>正在思考</span></span>
+        <button id="interruptBtn" class="danger hidden">停止</button>
+      </header>
+
+      <div id="messages" class="messages"><div class="empty"><span>✦</span><strong>准备好开始</strong><small>选择一个任务查看历史记录</small></div></div>
+      <div class="bottom-stack">
+        <section id="queuePanel" class="queue-panel hidden"><header><strong>排队消息</strong><button id="clearQueueBtn" class="ghost">清空</button></header><div id="queueList"></div></section>
+        <div id="approval" class="approval hidden"></div>
+        <div id="attachmentTray" class="attachment-tray hidden"></div>
+
+        <form id="composer" class="composer">
+        <input id="fileInput" type="file" multiple hidden accept="image/*,.txt,.md,.json,.csv,.log,.pdf,.doc,.docx,.xls,.xlsx,.zip">
+        <textarea id="messageInput" rows="1" placeholder="给 Codex 发送任务…" disabled></textarea>
+        <div class="composer-tools left-tools">
+          <button id="attachBtn" type="button" class="attach" disabled title="添加附件">＋</button>
+          <button id="permissionShortcut" type="button" class="permission-shortcut" title="权限模式">完全访问</button>
+          <button id="mobileToolsBtn" type="button" class="mobile-tools-btn">参数</button>
+        </div>
+        <div id="composerSettings" class="composer-tools right-tools">
+          <label><span>发送</span><select id="sendMode" disabled title="发送方式"><option value="auto">自动</option><option value="steer">引导</option><option value="queue">排队</option></select></label>
+          <label><span>模型</span><select id="modelSelect" disabled title="模型"><option value="">默认模型</option></select></label>
+          <label><span>思考</span><select id="effortSelect" disabled title="思考强度"><option value="">默认</option></select></label>
+          <label><span>摘要</span><select id="summarySelect" disabled title="推理摘要"><option value="">跟随 App</option><option value="auto">自动摘要</option><option value="concise">简洁摘要</option><option value="detailed">详细摘要</option><option value="none">不显示摘要</option></select></label>
+        </div>
+        <button id="sendBtn" type="submit" disabled title="发送" aria-label="发送">↑</button>
+        </form>
+      </div>
+      <div id="toast" class="toast hidden"></div>
+    </section>
+  </main>
+  <div id="usageModal" class="modal-backdrop hidden" role="presentation">
+    <section class="usage-dialog" role="dialog" aria-modal="true" aria-labelledby="usageTitle">
+      <header><h2 id="usageTitle">使用量</h2><button id="usageCloseBtn" type="button" aria-label="关闭">×</button></header>
+      <div id="usageLoading" class="usage-loading">正在读取使用情况…</div>
+      <div id="usageContent" class="usage-content hidden">
+        <section class="usage-card limit-card">
+          <div><strong id="usageLimitName">Codex 使用限额</strong><small id="usageResetAt">正在读取重置时间</small></div>
+          <div class="usage-meter"><span><i id="usageMeterFill"></i></span><b id="usageRemaining">剩余 --</b></div>
+        </section>
+        <section class="usage-card reset-card">
+          <div><strong>使用限额重置</strong><small id="usageCreditDetail">使用账户获得的重置次数</small></div>
+          <button id="resetLimitBtn" type="button"><span id="resetCreditCount">可用 0 次</span><b>⌄</b></button>
+        </section>
+        <section class="usage-stats">
+          <div><small>今日 Token</small><strong id="usageTodayTokens">--</strong></div>
+          <div><small>累计 Token</small><strong id="usageLifetimeTokens">--</strong></div>
+          <div><small>套餐</small><strong id="usagePlan">--</strong></div>
+        </section>
+        <p id="usageMessage" class="usage-message"></p>
+      </div>
+    </section>
+  </div>
+  <script type="module" src="/app.js?v=20260720-1700"></script>
+</body>
+</html>

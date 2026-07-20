@@ -1,0 +1,24 @@
+{
+  "name": "codex-web-remote",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check src/codex-client.mjs && node --check src/server-request.mjs && node --check src/terminal-session.mjs && node --check public/app.js && node --check public/reasoning-state.js && node --check public/timeline.js && node --check public/terminal.js && node --check scripts/reasoning-test.mjs && node --check scripts/server-request-test.mjs && node --check scripts/smoke-test.mjs && node --check scripts/web-integration-test.mjs && node --check scripts/mcp-browser-test.mjs",
+    "test:reasoning": "node scripts/reasoning-test.mjs",
+    "test:requests": "node scripts/server-request-test.mjs",
+    "test:browser-mcp": "node scripts/mcp-browser-test.mjs",
+    "smoke": "node scripts/smoke-test.mjs",
+    "integration": "node scripts/web-integration-test.mjs"
+  },
+  "dependencies": {
+    "@openai/codex": "0.144.6",
+    "@playwright/mcp": "0.0.78",
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/xterm": "5.5.0",
+    "express": "^5.1.0",
+    "node-pty": "1.1.0",
+    "ws": "^8.18.3"
+  }
+}
