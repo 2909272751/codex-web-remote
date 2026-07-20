@@ -10,6 +10,7 @@ const port = 18992;
 const base = `http://127.0.0.1:${port}`;
 const password = "integration-test-only";
 let cookie = "";
+let secondaryCookie = "";
 let lastSetCookie = "";
 let child;
 let socket;
@@ -27,9 +28,10 @@ const serverEnv = {
 };
 
 const request = async (url, options = {}) => {
+  const sessionCookie = options.sessionCookie ?? cookie;
   const response = await fetch(`${base}${url}`, {
     method: options.method || "GET",
-    headers: { ...(cookie ? { Cookie: cookie } : {}), ...(options.body ? { "Content-Type": "application/json" } : {}) },
+    headers: { ...(sessionCookie ? { Cookie: sessionCookie } : {}), ...(options.body ? { "Content-Type": "application/json" } : {}) },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   if (response.headers.get("set-cookie")) { lastSetCookie = response.headers.get("set-cookie"); cookie = lastSetCookie.split(";")[0]; }
@@ -67,6 +69,18 @@ try {
   const persistedSessions = await fsp.readFile(path.join(temp, "data", "sessions.json"), "utf8");
   if (persistedSessions.includes(cookie.split("=")[1])) throw new Error("Raw session token was persisted");
   await request("/api/control/takeover", { method: "POST", body: {} });
+  const primaryCookie = cookie;
+  await request("/api/login", { method: "POST", body: { password } });
+  secondaryCookie = cookie;
+  const secondaryControl = await request("/api/control/status");
+  if (!secondaryControl.controller || secondaryControl.controllerBusy || !secondaryControl.sharedWebControl) {
+    throw new Error(`Second Web session did not receive shared control: ${JSON.stringify(secondaryControl)}`);
+  }
+  cookie = primaryCookie;
+  const primaryControl = await request("/api/control/status");
+  if (!primaryControl.controller || primaryControl.controllerBusy || !primaryControl.sharedWebControl) {
+    throw new Error(`First Web session lost shared control: ${JSON.stringify(primaryControl)}`);
+  }
   let accountUsageVerified = true;
   try {
     const accountUsage = await request("/api/account/usage");
@@ -118,9 +132,13 @@ try {
       if (event.data.method === "turn/completed") { completedCount += 1; completedTurns.push(event.data.params.turn); }
     } catch { }
   });
-  await request(`/api/threads/${threadId}/messages`, { method: "POST", body: { text: "Run a shell command that prints TIMELINE_COMMAND_OK, then reply with exactly QUEUE_FIRST_OK.", mode: "auto", effort: "low", summary: "detailed" } });
-  const queued = await request(`/api/threads/${threadId}/messages`, { method: "POST", body: { text: "Reply with exactly QUEUE_SECOND_OK.", mode: "queue" } });
-  if (!queued.queued) throw new Error("Second message was not queued");
+  const [primarySubmission, secondarySubmission] = await Promise.all([
+    request(`/api/threads/${threadId}/messages`, { method: "POST", sessionCookie: primaryCookie, body: { text: "Run a shell command that prints TIMELINE_COMMAND_OK, then reply with exactly QUEUE_FIRST_OK.", mode: "auto", effort: "low", summary: "detailed" } }),
+    request(`/api/threads/${threadId}/messages`, { method: "POST", sessionCookie: secondaryCookie, body: { text: "Reply with exactly QUEUE_SECOND_OK.", mode: "auto" } }),
+  ]);
+  if (Number(Boolean(primarySubmission.queued)) + Number(Boolean(secondarySubmission.queued)) !== 1) {
+    throw new Error(`Concurrent Web submissions were not serialized: ${JSON.stringify({ primarySubmission, secondarySubmission })}`);
+  }
   await waitFor(async () => {
     const status = await request("/api/control/status");
     return completedCount >= 2 && !status.activeTurns?.[threadId] && !status.queuedByThread?.[threadId];
