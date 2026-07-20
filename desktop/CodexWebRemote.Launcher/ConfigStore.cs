@@ -34,14 +34,14 @@ internal sealed class ConfigStore
         return Encoding.UTF8.GetString(ProtectedData.Unprotect(encrypted, Entropy, DataProtectionScope.CurrentUser));
     }
 
-    public AppSettings Save(string password, int port, bool secureCookie, bool autoStart, string publicUrl = "")
+    public AppSettings Save(string password, int port, bool secureCookie, bool autoStart, string publicUrl = "", bool applyAutoStart = true)
     {
         var encrypted = ProtectedData.Protect(Encoding.UTF8.GetBytes(password), Entropy, DataProtectionScope.CurrentUser);
         var settings = new AppSettings(Convert.ToBase64String(encrypted), port, secureCookie, autoStart, publicUrl.Trim());
         var temp = _paths.SettingsFile + ".tmp";
         File.WriteAllText(temp, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
         File.Move(temp, _paths.SettingsFile, true);
-        SetAutoStart(autoStart);
+        if (applyAutoStart) SetAutoStart(autoStart);
         return settings;
     }
 

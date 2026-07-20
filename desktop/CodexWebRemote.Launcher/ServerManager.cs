@@ -57,6 +57,7 @@ internal sealed class ServerManager : IDisposable
             start.Environment["CODEX_WEB_SECURE_COOKIE"] = settings.SecureCookie ? "1" : "0";
             start.Environment["CODEX_WEB_SESSION_HOURS"] = "24";
             start.Environment["CODEX_WEB_DATA_DIR"] = _paths.DataRoot;
+            start.Environment["CODEX_WEB_UPDATE_REQUEST_FILE"] = _paths.UpdateRequestFile;
             _process = new Process { StartInfo = start, EnableRaisingEvents = true };
             _process.OutputDataReceived += (_, e) => AppendLog(e.Data);
             _process.ErrorDataReceived += (_, e) => AppendLog(e.Data);
