@@ -87,9 +87,18 @@ try {
   const draftRestartSession = await request("/api/session");
   if (!draftRestartSession.authenticated) throw new Error("Session did not survive the empty-task recovery restart");
   await request("/api/control/takeover", { method: "POST", body: {} });
+  const draftsAfterRestart = await request("/api/threads");
+  if (!draftsAfterRestart.data?.some((thread) => thread.id === emptyDraft.thread.id && thread.cwd === root)) {
+    throw new Error(`An empty task disappeared from the Web list after restart: ${JSON.stringify(draftsAfterRestart.data)}`);
+  }
   const recoveredDraft = await request(`/api/threads/${emptyDraft.thread.id}`);
   if (recoveredDraft.replacedThreadId !== emptyDraft.thread.id || recoveredDraft.thread?.id === emptyDraft.thread.id || recoveredDraft.thread?.cwd !== root) {
     throw new Error(`An empty task was not recovered after restart: ${JSON.stringify(recoveredDraft)}`);
+  }
+  const draftsAfterRecovery = await request("/api/threads");
+  if (draftsAfterRecovery.data?.some((thread) => thread.id === emptyDraft.thread.id)
+      || !draftsAfterRecovery.data?.some((thread) => thread.id === recoveredDraft.thread.id)) {
+    throw new Error(`The recovered task did not replace its stale list entry: ${JSON.stringify(draftsAfterRecovery.data)}`);
   }
   let accountUsageVerified = true;
   try {

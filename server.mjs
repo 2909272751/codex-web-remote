@@ -301,12 +301,19 @@ app.get("/api/directories", requireAuth, asyncRoute(async (req, res) => {
 }));
 
 app.get("/api/threads", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
   const result = await codex.request("thread/list", {
-    limit: Math.min(100, Math.max(1, Number(req.query.limit || 50))), sortKey: "recency_at", sortDirection: "desc",
+    limit, sortKey: "recency_at", sortDirection: "desc",
     archived: false, modelProviders: [], sourceKinds: null,
   });
-  await saveThreadCache(result.data || []);
-  res.json(result);
+  const liveThreads = result.data || [];
+  await saveThreadCache(liveThreads);
+  const merged = new Map((await readThreadPreviews()).map((thread) => [thread.id, thread]));
+  for (const thread of liveThreads) {
+    if (thread?.id) merged.set(thread.id, { ...merged.get(thread.id), ...thread });
+  }
+  const data = [...merged.values()].sort((left, right) => threadTime(right) - threadTime(left)).slice(0, limit);
+  res.json({ ...result, data });
 }));
 
 app.post("/api/threads", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {

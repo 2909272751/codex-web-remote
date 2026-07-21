@@ -80,7 +80,7 @@ export class CodexClient extends EventEmitter {
       clientInfo: {
         name: "codex_web_remote",
         title: "Codex Web Remote",
-        version: "1.4.1",
+        version: "1.4.2",
       },
       capabilities: { experimentalApi: true },
     });
