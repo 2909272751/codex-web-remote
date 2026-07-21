@@ -42,6 +42,13 @@ const testDropTurnCompleted = testMode && process.env.CODEX_WEB_TEST_DROP_TURN_C
 const defaultFullAccess = process.env.CODEX_WEB_DEFAULT_FULL_ACCESS !== "0";
 let testDropTurnCompletedRemaining = testDropTurnCompleted ? 1 : 0;
 
+process.on("unhandledRejection", (error) => {
+  console.error("unhandled rejection", error);
+});
+process.on("uncaughtException", (error) => {
+  console.error("uncaught exception", error);
+});
+
 if (!password || password.length < 8) {
   console.error("CODEX_WEB_PASSWORD must contain at least 8 characters.");
   process.exit(1);
@@ -97,6 +104,7 @@ let eventSeq = 0;
 let desktopConflictCheckInFlight = false;
 let desktopSessionWatcher = null;
 let readonlyAccountUsageRequest = null;
+let localSessionUsageCache = null;
 let lastControlAudit = await loadLastJsonLine(controlAuditFile);
 const eventBuffer = [];
 const eventBufferLimit = 1_000;
@@ -372,16 +380,20 @@ app.get("/api/models", requireAuth, requireWebMode, asyncRoute(async (req, res) 
 }));
 
 app.get("/api/account/usage", requireAuth, asyncRoute(async (req, res) => {
+  const accountKey = await currentAccountUsageKey();
+  const bucket = setActiveUsageAccount(accountKey);
+  const localSessionUsage = await readLocalSessionTokenUsage(accountKey, bucket);
+  void atomicJson(accountUsageHistoryFile, accountUsageHistory).catch(() => {});
   if (mode === "web" && codex.ready) {
     const rateLimits = await codex.request("account/rateLimits/read", null);
     let usage = null;
     try { usage = await codex.request("account/usage/read", null); } catch { }
-    if (usage) await recordAccountUsageSample(usage);
+    if (usage) await recordAccountUsageSample(usage, accountKey);
     await saveAccountUsageSnapshot(rateLimits, usage);
-    return res.json({ rateLimits, usage, history: accountUsageHistory, live: true, cachedAt: accountUsageSnapshot?.cachedAt || Date.now() });
+    return res.json({ rateLimits, usage, history: accountScopedUsageHistory(accountKey, localSessionUsage), live: true, cachedAt: accountUsageSnapshot?.cachedAt || Date.now() });
   }
   if (!accountUsageSnapshot?.rateLimits) return res.status(409).json({ error: "尚无可显示的额度快照；首次接管后会自动保存，之后可在只读模式查看。" });
-  res.json({ ...accountUsageSnapshot, history: accountUsageHistory, live: false });
+  res.json({ ...accountUsageSnapshot, history: accountScopedUsageHistory(accountKey, localSessionUsage), live: false });
 }));
 
 app.get("/api/accounts", requireAuth, asyncRoute(async (req, res) => {
@@ -402,7 +414,12 @@ app.post("/api/accounts/activate", requireAuth, requireWebMode, requireControlle
     await codex.stop();
     const result = await runAccountSwitcher(["--account-switch-activate", profileId]);
     accountUsageSnapshot = null;
-    accountUsageHistory = { samples: [] };
+    const previousAccountKey = accountUsageHistory.activeKey;
+    const accountKey = await currentAccountUsageKey(profileId);
+    if (previousAccountKey && previousAccountKey !== accountKey) closeUsagePeriod(previousAccountKey);
+    const bucket = setActiveUsageAccount(accountKey);
+    if (!bucket.resetAt) bucket.resetAt = Date.now();
+    localSessionUsageCache = null;
     await Promise.all([
       fsp.rm(accountUsageSnapshotFile, { force: true }),
       atomicJson(accountUsageHistoryFile, accountUsageHistory),
@@ -463,7 +480,7 @@ app.get("/api/thread-previews/:id", requireAuth, asyncRoute(async (req, res) => 
 app.post("/api/threads/:id/messages", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
   const text = String(req.body?.text || "").trim();
   const modeRequested = String(req.body?.mode || "auto");
-  const input = await buildInput(text, req.body?.attachmentIds || []);
+  const input = await buildInput(text, req.body?.attachmentIds || [], req.sessionToken);
   if (!input.length) return res.status(400).json({ error: "消息或附件不能为空" });
   const threadId = req.params.id;
   const activeTurnId = activeTurns.get(threadId);
@@ -523,8 +540,8 @@ app.post("/api/threads/:id/queue/:itemId/steer", requireAuth, requireController,
   await saveQueues(); broadcastQueue(threadId); res.json(result);
 }));
 
-app.post("/api/uploads", requireAuth, requireController, requireSameOrigin, express.raw({ type: "application/octet-stream", limit: "50mb" }), asyncRoute(async (req, res) => {
-  const originalName = sanitizeFileName(decodeURIComponent(String(req.query.name || "attachment")));
+app.post("/api/uploads", requireAuth, requireSameOrigin, express.raw({ type: "application/octet-stream", limit: "50mb" }), asyncRoute(async (req, res) => {
+  const originalName = sanitizeFileName(safeDecodeURIComponent(String(req.query.name || "attachment")));
   const mime = String(req.query.type || "application/octet-stream").slice(0, 120);
   const isImage = ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime);
   if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: "空文件" });
@@ -541,7 +558,11 @@ app.post("/api/uploads", requireAuth, requireController, requireSameOrigin, expr
 app.get("/api/uploads/:id", requireAuth, asyncRoute(async (req, res) => {
   const item = uploads.get(req.params.id);
   if (!item || item.owner !== req.sessionToken || !item.isImage) return res.status(404).end();
-  res.type(item.mime).send(await fsp.readFile(item.path));
+  res.type(item.mime);
+  fs.createReadStream(item.path).on("error", () => {
+    if (!res.headersSent) res.status(404).end();
+    else res.destroy();
+  }).pipe(res);
 }));
 
 app.delete("/api/uploads/:id", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -584,8 +605,10 @@ app.use(express.static(path.join(root, "public"), {
 }));
 app.use("/api", (req, res) => res.status(404).json({ error: "Not found" }));
 app.use((error, req, res, next) => {
-  console.error(error); if (res.headersSent) return next(error);
-  res.status(error.type === "entity.too.large" ? 413 : 500).json({ error: error.type === "entity.too.large" ? "文件太大" : (error.message || "服务器错误") });
+  if (res.headersSent) return next(error);
+  const status = error.type === "entity.too.large" ? 413 : (Number(error.status) || Number(error.statusCode) || 500);
+  if (status >= 500) console.error(error);
+  res.status(status).json({ error: error.type === "entity.too.large" ? "文件太大" : (error.message || "服务器错误") });
 });
 
 const server = app.listen(port, host, async () => {
@@ -609,13 +632,20 @@ wss.on("connection", (ws, req) => {
   const since = Math.max(0, Number(requestUrl.searchParams.get("since") || 0) || 0);
   const oldest = eventBuffer[0]?.seq ?? (eventSeq + 1);
   const replayAvailable = since === 0 || (since <= eventSeq && since >= oldest - 1);
-  ws.send(JSON.stringify({ type: "hello", data: { eventSeq, replayAvailable, oldestEventSeq: oldest } }));
-  if (replayAvailable && since > 0) for (const event of eventBuffer) if (event.seq > since && ws.readyState === 1) ws.send(JSON.stringify(event));
+  safeWsSend(ws, { type: "hello", data: { eventSeq, replayAvailable, oldestEventSeq: oldest } });
+  if (replayAvailable && since > 0) for (const event of eventBuffer) if (event.seq > since) safeWsSend(ws, event);
+  ws.on("error", () => { sockets.delete(ws); });
   ws.on("close", () => { sockets.delete(ws); broadcastState(); });
 });
-terminalWss.on("connection", (ws, req) => { if (terminalControllerToken !== req.sessionToken || mode !== "terminal") return ws.close(1008, "No terminal control"); if (terminal.buffer) ws.send(JSON.stringify({ type: "data", data: terminal.buffer })); ws.send(JSON.stringify({ type: "status", data: terminal.status() })); ws.on("message", (raw) => { try { const message = JSON.parse(String(raw)); if (message.type === "input") terminal.write(message.data); if (message.type === "resize") terminal.resize(Number(message.cols), Number(message.rows)); } catch { } }); });
-terminal.on("data", (data) => { const body = JSON.stringify({ type: "data", data }); for (const ws of terminalWss.clients) if (ws.readyState === 1) ws.send(body); });
-terminal.on("exit", (data) => { const body = JSON.stringify({ type: "exit", data }); for (const ws of terminalWss.clients) if (ws.readyState === 1) ws.send(body); });
+terminalWss.on("connection", (ws, req) => {
+  if (terminalControllerToken !== req.sessionToken || mode !== "terminal") return ws.close(1008, "No terminal control");
+  if (terminal.buffer) safeWsSend(ws, { type: "data", data: terminal.buffer });
+  safeWsSend(ws, { type: "status", data: terminal.status() });
+  ws.on("error", () => {});
+  ws.on("message", (raw) => { try { const message = JSON.parse(String(raw)); if (message.type === "input") terminal.write(message.data); if (message.type === "resize") terminal.resize(Number(message.cols), Number(message.rows)); } catch { } });
+});
+terminal.on("data", (data) => { for (const ws of terminalWss.clients) safeWsSend(ws, { type: "data", data }); });
+terminal.on("exit", (data) => { for (const ws of terminalWss.clients) safeWsSend(ws, { type: "exit", data }); });
 
 codex.on("notification", (data) => {
   const { method, params } = data;
@@ -624,7 +654,10 @@ codex.on("notification", (data) => {
   if (dropTurnCompleted) testDropTurnCompletedRemaining -= 1;
   if (method === "serverRequest/resolved" && params?.requestId != null) pendingApprovals.delete(String(params.requestId));
   if (method === "thread/settings/updated" && threadId && params.threadSettings) threadSettings.set(threadId, params.threadSettings);
-  if (method === "thread/tokenUsage/updated" && threadId && params.tokenUsage) { threadTokenUsage.set(threadId, params.tokenUsage); void recordObservedTokenUsage(threadId, params.tokenUsage); }
+  if (method === "thread/tokenUsage/updated" && threadId && params.tokenUsage) {
+    threadTokenUsage.set(threadId, params.tokenUsage);
+    void recordObservedTokenUsage(threadId, params.tokenUsage).catch((error) => console.error(`token usage record failed: ${error.message}`));
+  }
   if (method === "turn/plan/updated" && threadId) turnPlans.set(threadId, { turnId: params.turnId, plan: params.plan || [], explanation: params.explanation || "" });
   if (method === "turn/diff/updated" && threadId) turnDiffs.set(threadId, { turnId: params.turnId, diff: params.diff || "" });
   if (method === "thread/status/changed" && threadId && params.status) {
@@ -805,13 +838,13 @@ async function verifyThreadActive(threadId) {
   }
 }
 
-async function buildInput(text, attachmentIds) {
-  if (text.length > 50_000) throw new Error("消息过长");
+async function buildInput(text, attachmentIds, ownerToken = "") {
+  if (text.length > 50_000) throw httpError(400, "消息过长");
   const input = [];
   let message = text;
   for (const id of attachmentIds.slice(0, 10)) {
     const item = uploads.get(String(id));
-    if (!item) throw new Error("附件已失效，请重新上传");
+    if (!item || item.owner !== ownerToken) throw httpError(400, "附件已失效，请重新上传");
     if (item.isImage) input.push({ type: "localImage", path: item.path });
     else message += `${message ? "\n\n" : ""}附件：${item.name}\n本机路径：${item.path}\n请按用户要求读取此附件。`;
   }
@@ -1272,23 +1305,106 @@ async function projectCatalog() {
 
 async function saveProjects() { await atomicJson(projectFile, projectStore); }
 
-function normalizeAccountUsageHistory(value) {
+function emptyUsageBucket(resetAt = 0) {
+  return { resetAt: Math.max(0, Number(resetAt || 0)), samples: [], observed: [], periods: [] };
+}
+function normalizeUsageBucket(value) {
   const samples = Array.isArray(value?.samples) ? value.samples : [];
   const observed = Array.isArray(value?.observed) ? value.observed : [];
+  const periods = Array.isArray(value?.periods) ? value.periods : [];
   return {
+    resetAt: Math.max(0, Number(value?.resetAt || 0)),
     samples: samples.filter((item) => Number.isFinite(Number(item?.at)) && typeof item?.day === "string" && Number.isFinite(Number(item?.tokens))).slice(-2_000),
     observed: observed.filter((item) => Number.isFinite(Number(item?.at))).map((item) => ({ at: Number(item.at), input: Math.max(0, Number(item.input || 0)), output: Math.max(0, Number(item.output || 0)), cached: Math.max(0, Number(item.cached || 0)) })).slice(-20_000),
+    periods: periods.filter((item) => Number.isFinite(Number(item?.from))).map((item) => ({ from: Math.max(0, Number(item.from)), to: Math.max(0, Number(item.to || 0)) })).slice(-300),
   };
 }
-async function recordAccountUsageSample(usage) {
+function safeUsageAccountKey(value) {
+  return String(value || "default").replace(/[^A-Za-z0-9:_-]/g, "_").slice(0, 120) || "default";
+}
+function normalizeAccountUsageHistory(value) {
+  const legacy = normalizeUsageBucket(value);
+  const accounts = {};
+  if (value?.accounts && typeof value.accounts === "object") {
+    for (const [key, bucket] of Object.entries(value.accounts)) accounts[safeUsageAccountKey(key)] = normalizeUsageBucket(bucket);
+  }
+  if (!Object.keys(accounts).length && (legacy.resetAt || legacy.samples.length || legacy.observed.length)) accounts.default = legacy;
+  const activeKey = safeUsageAccountKey(value?.activeKey || Object.keys(accounts)[0] || "default");
+  return { activeKey, accounts, resetAt: legacy.resetAt, samples: legacy.samples, observed: legacy.observed };
+}
+function currentUsageBucket(accountKey = accountUsageHistory.activeKey || "default") {
+  const key = safeUsageAccountKey(accountKey);
+  if (!accountUsageHistory.accounts || typeof accountUsageHistory.accounts !== "object") accountUsageHistory.accounts = {};
+  if (!accountUsageHistory.accounts[key]) accountUsageHistory.accounts[key] = emptyUsageBucket();
+  accountUsageHistory.activeKey = key;
+  const bucket = accountUsageHistory.accounts[key];
+  if (!Array.isArray(bucket.samples)) bucket.samples = [];
+  if (!Array.isArray(bucket.observed)) bucket.observed = [];
+  if (!Array.isArray(bucket.periods)) bucket.periods = [];
+  accountUsageHistory.resetAt = bucket.resetAt;
+  accountUsageHistory.samples = bucket.samples;
+  accountUsageHistory.observed = bucket.observed;
+  return bucket;
+}
+function openUsagePeriod(accountKey, at = Date.now()) {
+  const bucket = currentUsageBucket(accountKey);
+  const last = bucket.periods.at(-1);
+  const existingStart = Math.max(0, Number(bucket.resetAt || 0));
+  if (last && !last.to) {
+    if (!bucket.observed.length && !bucket.samples.length && last.from > existingStart) last.from = existingStart;
+    return bucket;
+  }
+  bucket.periods.push({ from: bucket.periods.length ? at : (existingStart || at), to: 0 });
+  bucket.periods = bucket.periods.slice(-300);
+  return bucket;
+}
+function closeUsagePeriod(accountKey, at = Date.now()) {
+  const bucket = currentUsageBucket(accountKey);
+  const last = bucket.periods.at(-1);
+  if (last && !last.to) last.to = Math.max(last.from, at);
+  return bucket;
+}
+function setActiveUsageAccount(accountKey) {
+  const key = safeUsageAccountKey(accountKey);
+  const previous = accountUsageHistory.activeKey;
+  if (previous && previous !== key) closeUsagePeriod(previous);
+  return openUsagePeriod(key);
+}
+function accountScopedUsageHistory(accountKey, localSessions) {
+  const key = safeUsageAccountKey(accountKey);
+  const bucket = currentUsageBucket(key);
+  return { ...accountUsageHistory, activeKey: key, resetAt: bucket.resetAt, samples: bucket.samples, observed: bucket.observed, localSessions };
+}
+async function currentAccountUsageKey(profileHint = "") {
+  const codexRoot = process.env.CODEX_HOME ? path.resolve(process.env.CODEX_HOME) : path.join(process.env.USERPROFILE || root, ".codex");
+  const profile = safeUsageAccountKey(profileHint);
+  if (profile && profile !== "default") return `profile:${profile}`;
+  for (const file of [
+    path.join(codexRoot, "account-switcher", "index.json"),
+    path.join(codexRoot, "accounts", "index.json"),
+  ]) {
+    try {
+      const index = JSON.parse(await fsp.readFile(file, "utf8"));
+      const active = index?.activeProfileId || index?.active || index?.currentProfileId;
+      if (typeof active === "string" && active.trim()) return `profile:${safeUsageAccountKey(active)}`;
+    } catch { }
+  }
+  try {
+    const auth = await fsp.readFile(path.join(codexRoot, "auth.json"));
+    return `auth:${crypto.createHash("sha256").update(auth).digest("hex").slice(0, 16)}`;
+  } catch { return "default"; }
+}
+async function recordAccountUsageSample(usage, accountKey = accountUsageHistory.activeKey || "default") {
   const buckets = Array.isArray(usage?.dailyUsageBuckets) ? usage.dailyUsageBuckets : [];
   const today = new Date().toISOString().slice(0, 10);
   const tokens = Number(buckets.find((item) => item?.startDate === today)?.tokens);
   if (!Number.isFinite(tokens)) return;
-  const last = accountUsageHistory.samples.at(-1);
+  const bucket = currentUsageBucket(accountKey);
+  const last = bucket.samples.at(-1);
   if (last?.day === today && last.tokens === tokens && Date.now() - last.at < 15 * 60_000) return;
-  accountUsageHistory.samples.push({ at: Date.now(), day: today, tokens });
-  accountUsageHistory.samples = accountUsageHistory.samples.filter((item) => item.at >= Date.now() - 45 * 86400_000).slice(-2_000);
+  bucket.samples.push({ at: Date.now(), day: today, tokens });
+  bucket.samples = bucket.samples.filter((item) => item.at >= Date.now() - 45 * 86400_000).slice(-2_000);
+  currentUsageBucket(accountKey);
   await atomicJson(accountUsageHistoryFile, accountUsageHistory);
 }
 async function saveAccountUsageSnapshot(rateLimits, usage) {
@@ -1318,14 +1434,95 @@ async function recordObservedTokenUsage(threadId, usage) {
   if (!previous) return;
   const delta = { input: Math.max(0, next.input - previous.input), output: Math.max(0, next.output - previous.output), cached: Math.max(0, next.cached - previous.cached) };
   if (!delta.input && !delta.output && !delta.cached) return;
-  accountUsageHistory.observed.push({ at: Date.now(), ...delta });
-  accountUsageHistory.observed = accountUsageHistory.observed.filter((item) => item.at >= Date.now() - 45 * 86400_000).slice(-20_000);
+  const accountKey = await currentAccountUsageKey();
+  const bucket = setActiveUsageAccount(accountKey);
+  bucket.observed.push({ at: Date.now(), ...delta });
+  bucket.observed = bucket.observed.filter((item) => item.at >= Date.now() - 45 * 86400_000).slice(-20_000);
+  currentUsageBucket(accountKey);
   await atomicJson(accountUsageHistoryFile, accountUsageHistory);
+}
+function usageRangesForBucket(bucket, fallbackResetAt) {
+  const periods = Array.isArray(bucket?.periods) ? bucket.periods.filter((item) => Number.isFinite(Number(item?.from))) : [];
+  if (periods.length) return periods.map((item) => ({ from: Math.max(0, Number(item.from)), to: Math.max(0, Number(item.to || 0)) }));
+  return [{ from: Math.max(0, Number(fallbackResetAt || 0)), to: 0 }];
+}
+function timestampInUsageRanges(at, ranges) {
+  if (!Number.isFinite(Number(at)) || !ranges.length) return true;
+  return ranges.some((range) => at >= range.from && (!range.to || at <= range.to));
+}
+async function readLocalSessionTokenUsage(accountKey = "default", bucket = null) {
+  const key = safeUsageAccountKey(accountKey);
+  const effectiveResetAt = bucket?.resetAt || await localUsageResetFallback();
+  const ranges = usageRangesForBucket(bucket, effectiveResetAt);
+  const rangeKey = ranges.map((range) => `${Math.floor(range.from)}-${Math.floor(range.to || 0)}`).join(",");
+  const scanFrom = Math.min(...ranges.map((range) => range.from).filter(Number.isFinite), effectiveResetAt || 0);
+  const cacheKey = `${key}:${rangeKey}:${await newestSessionMtime()}`;
+  if (localSessionUsageCache?.key === cacheKey && Date.now() - localSessionUsageCache.at < 60_000) return localSessionUsageCache.value;
+  const items = [];
+  const stack = [sessionRoot];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const target = path.join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(target);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        let stat;
+        try { stat = await fsp.stat(target); } catch { continue; }
+        if (stat.mtimeMs >= scanFrom) items.push({ file: target, mtimeMs: stat.mtimeMs });
+      }
+    }
+  }
+  const records = [];
+  for (const item of items.sort((left, right) => left.mtimeMs - right.mtimeMs).slice(-80)) await collectSessionTokenUsage(item.file, ranges, records);
+  const value = { accountKey: key, resetAt: effectiveResetAt, ranges, records: records.slice(-20_000) };
+  localSessionUsageCache = { key: cacheKey, at: Date.now(), value };
+  return value;
+}
+async function collectSessionTokenUsage(file, ranges, records) {
+  const stream = fs.createReadStream(file, { encoding: "utf8" });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  for await (const line of lines) {
+    let record;
+    try { record = JSON.parse(line); } catch { continue; }
+    if (record?.type !== "event_msg" || record.payload?.type !== "token_count") continue;
+    const at = Date.parse(record.timestamp || "") || 0;
+    if (at && !timestampInUsageRanges(at, ranges)) continue;
+    const last = record.payload?.info?.last_token_usage || record.payload?.info?.lastTokenUsage;
+    const breakdown = tokenBreakdown(last);
+    if (!breakdown.input && !breakdown.output && !breakdown.cached) continue;
+    records.push({ at: at || Date.now(), ...breakdown });
+  }
+}
+async function localUsageResetFallback() {
+  try {
+    const stat = await fsp.stat(accountUsageHistoryFile);
+    return stat.size <= 64 ? stat.mtimeMs : 0;
+  } catch { return 0; }
+}
+async function newestSessionMtime() {
+  let newest = 0;
+  const stack = [sessionRoot];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const target = path.join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(target);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        try { newest = Math.max(newest, (await fsp.stat(target)).mtimeMs); } catch { }
+      }
+    }
+  }
+  return Math.floor(newest);
 }
 async function sampleAccountUsage() {
   try {
+    const accountKey = await currentAccountUsageKey();
     const usage = await codex.request("account/usage/read", null);
-    if (usage) await recordAccountUsageSample(usage);
+    if (usage) await recordAccountUsageSample(usage, accountKey);
   } catch { /* Account metrics are optional and must never disturb a task. */ }
 }
 
@@ -1351,8 +1548,18 @@ function broadcast(message, record = true) {
     eventBuffer.push(event);
     if (eventBuffer.length > eventBufferLimit) eventBuffer.splice(0, eventBuffer.length - eventBufferLimit);
   }
-  const body = JSON.stringify(event);
-  for (const ws of sockets) if (ws.readyState === 1) ws.send(body);
+  for (const ws of sockets) safeWsSend(ws, event);
+}
+function safeWsSend(ws, message) {
+  if (ws.readyState !== 1) return false;
+  try {
+    ws.send(typeof message === "string" ? message : JSON.stringify(message));
+    return true;
+  } catch (error) {
+    console.error(`websocket send failed: ${error.message}`);
+    try { ws.close(); } catch { }
+    return false;
+  }
 }
 
 function handleServerRequest(data) {
@@ -1683,6 +1890,8 @@ async function saveSessions() { await atomicJson(sessionFile, Object.fromEntries
 function safeEqual(a, b) { return crypto.timingSafeEqual(crypto.createHash("sha256").update(a).digest(), crypto.createHash("sha256").update(b).digest()); }
 function clientIp(req) { return req.socket.remoteAddress || "unknown"; }
 function asyncRoute(handler) { return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next); }
+function httpError(status, message) { const error = new Error(message); error.status = status; return error; }
+function safeDecodeURIComponent(value) { try { return decodeURIComponent(value); } catch { return value; } }
 function sanitizeFileName(name) { return path.basename(name).replace(/[^\p{L}\p{N}._ -]/gu, "_").slice(0, 120) || "attachment"; }
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 async function loadJson(file, fallback) { try { return JSON.parse(await fsp.readFile(file, "utf8")); } catch { return fallback; } }

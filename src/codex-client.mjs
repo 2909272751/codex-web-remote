@@ -59,8 +59,12 @@ export class CodexClient extends EventEmitter {
       const stderr = this.stderrTail.slice(-12).join("\n").trim();
       const detail = stderr ? `\n${stderr}` : "";
       const error = new Error(`Codex app-server stopped (code=${code}, signal=${signal ?? "none"})${detail}`);
-      for (const { reject } of this.pending.values()) reject(error);
+      for (const { reject, timeout } of this.pending.values()) {
+        clearTimeout(timeout);
+        reject(error);
+      }
       this.pending.clear();
+      this.serverRequests.clear();
       this.ready = false;
       this.child = null;
       this.emit("status", { ready: false, error: error.message });
@@ -93,18 +97,25 @@ export class CodexClient extends EventEmitter {
   request(method, params = {}) {
     if (!this.child?.stdin?.writable) return Promise.reject(new Error("Codex app-server is unavailable"));
     const id = this.nextId++;
-    this.#send({ id, method, params });
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Codex request timed out: ${method}`));
       }, 60_000);
       this.pending.set(id, { resolve, reject, timeout, method });
+      try {
+        this.#send({ id, method, params });
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
   notify(method, params = {}) {
-    this.#send({ method, params });
+    try { this.#send({ method, params }); }
+    catch (error) { this.emit("protocolError", { message: error?.message || "Codex notify failed", method }); }
   }
 
   respondToServerRequest(id, result) {
@@ -132,6 +143,7 @@ export class CodexClient extends EventEmitter {
   }
 
   #send(message) {
+    if (!this.child?.stdin?.writable) throw new Error("Codex app-server is unavailable");
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
@@ -160,6 +172,16 @@ export class CodexClient extends EventEmitter {
       return;
     }
 
-    if (message.method) this.emit("notification", message);
+    if (message.method) {
+      try {
+        this.emit("notification", message);
+      } catch (error) {
+        this.emit("protocolError", {
+          message: error?.message || "Notification handler failed",
+          stack: error?.stack || "",
+          method: message.method,
+        });
+      }
+    }
   }
 }

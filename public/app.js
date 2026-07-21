@@ -764,6 +764,13 @@ function connectEvents() {
     if (event.seq && event.seq <= state.lastEventSeq) return;
     if (state.syncing) state.eventBacklog.push(event); else handleEvent(event);
   };
+  socket.onerror = () => {
+    if (state.socket === socket) {
+      state.socketConnected = false;
+      try { socket.close(); } catch { }
+      renderActivity();
+    }
+  };
   socket.onclose = () => {
     if (state.socket !== socket) return;
     state.socketConnected = false; state.socket = null; clearTimeout(state.reconnectStableTimer); state.reconnectCount = Math.min(8, state.reconnectCount + 1); renderActivity();
@@ -1149,17 +1156,22 @@ function renderAccountTokenTimeline(payload = {}) {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const buckets = Array.isArray(payload.usage?.dailyUsageBuckets) ? payload.usage.dailyUsageBuckets : [];
   const observed = Array.isArray(payload.history?.observed) ? payload.history.observed : [];
+  const localRecords = Array.isArray(payload.history?.localSessions?.records) ? payload.history.localSessions.records : [];
+  const detailRecords = localRecords.length ? localRecords : observed;
   const sumOfficial = (from) => buckets.filter((item) => item?.startDate >= dayKey(from)).reduce((sum, item) => sum + Math.max(0, Number(item?.tokens || 0)), 0);
-  const sumObserved = (from) => observed.filter((item) => Number(item?.at) >= from.getTime()).reduce((total, item) => ({ input: total.input + Math.max(0, Number(item?.input || 0)), output: total.output + Math.max(0, Number(item?.output || 0)), cached: total.cached + Math.max(0, Number(item?.cached || 0)) }), { input: 0, output: 0, cached: 0 });
+  const sumObserved = (records, from) => records.filter((item) => Number(item?.at) >= from.getTime()).reduce((total, item) => ({ input: total.input + Math.max(0, Number(item?.input || 0)), output: total.output + Math.max(0, Number(item?.output || 0)), cached: total.cached + Math.max(0, Number(item?.cached || 0)) }), { input: 0, output: 0, cached: 0 });
   const hourStart = new Date(now.getTime() - 60 * 60_000);
-  const hour = sumObserved(hourStart);
-  const month = sumObserved(monthStart);
+  const hour = sumObserved(detailRecords, hourStart);
+  const dayDetail = sumObserved(detailRecords, new Date(now.getFullYear(), now.getMonth(), now.getDate()));
+  const weekDetail = sumObserved(detailRecords, weekStart);
+  const month = sumObserved(detailRecords, monthStart);
   const officialDay = buckets.find((item) => item?.startDate === today)?.tokens;
-  const dayObserved = sumObserved(new Date(now.getFullYear(), now.getMonth(), now.getDate()));
   $("usageHourTokens").textContent = formatCount(hour.input + hour.output);
-  $("usageDayTokens").textContent = Number.isFinite(Number(officialDay)) ? formatCount(officialDay) : formatCount(dayObserved.input + dayObserved.output);
-  $("usageWeekTokens").textContent = formatCount(sumOfficial(weekStart));
-  $("usageMonthTokens").textContent = formatCount(sumOfficial(monthStart));
+  $("usageDayTokens").textContent = Number.isFinite(Number(officialDay)) && Number(officialDay) > 0 ? formatCount(officialDay) : formatCount(dayDetail.input + dayDetail.output);
+  const officialWeek = sumOfficial(weekStart);
+  const officialMonth = sumOfficial(monthStart);
+  $("usageWeekTokens").textContent = officialWeek ? formatCount(officialWeek) : formatCount(weekDetail.input + weekDetail.output);
+  $("usageMonthTokens").textContent = officialMonth ? formatCount(officialMonth) : formatCount(month.input + month.output);
   $("usageInputTokens").textContent = formatCount(month.input);
   $("usageOutputTokens").textContent = formatCount(month.output);
   $("usageCacheTokens").textContent = formatCount(month.cached);

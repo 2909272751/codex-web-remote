@@ -132,6 +132,16 @@ try {
   });
   const uploaded = await uploadResponse.json();
   if (!uploadResponse.ok || !uploaded.id || uploaded.size !== 19) throw new Error(`Upload endpoint did not persist attachment: ${JSON.stringify(uploaded)}`);
+  const malformedUpload = await fetch(`${base}/api/uploads?name=%E0%A4%A&type=text%2Fplain`, {
+    method: "POST", headers: { Cookie: cookie, Origin: base, "Content-Type": "application/octet-stream" }, body: Buffer.from("BAD_NAME_OK"),
+  });
+  if (!malformedUpload.ok) throw new Error(`Malformed upload filename was not handled safely: ${malformedUpload.status}`);
+  const crossSessionAttachment = await fetch(`${base}/api/threads/cross-session/messages`, {
+    method: "POST",
+    headers: { Cookie: secondaryCookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "", attachmentIds: [uploaded.id], mode: "queue" }),
+  });
+  if (crossSessionAttachment.ok) throw new Error("A Web session was able to submit another session's attachment");
   const deletedUpload = await request(`/api/uploads/${uploaded.id}`, { method: "DELETE", body: {} });
   if (!deletedUpload.ok) throw new Error("Uploaded attachment could not be removed");
   const emptyDraft = await request("/api/threads", { method: "POST", body: { cwd: root } });

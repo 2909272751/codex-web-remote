@@ -24,13 +24,28 @@ internal sealed class ServerManager : IDisposable
 
     public async Task<bool> StartAsync()
     {
-        if (_process is { HasExited: false }) return true;
         var settings = _config.Load();
         if (settings is null) { SetState(GatewayState.Failed, "请先完成首次设置"); return false; }
         if (!File.Exists(_paths.NodePath) || !File.Exists(_paths.ServerPath))
         {
             SetState(GatewayState.Failed, "运行文件不完整，请重新安装");
             return false;
+        }
+        if (_process is { HasExited: false })
+        {
+            if (await IsHealthyAsync(settings.Port))
+            {
+                SetState(GatewayState.Running, $"正在监听 127.0.0.1:{settings.Port}");
+                return true;
+            }
+            AppendLog("Node process is alive but health check failed; restarting gateway process.");
+            try
+            {
+                _process.Kill(true);
+                await _process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (Exception ex) { AppendLog(ex.Message); }
+            finally { _process.Dispose(); _process = null; }
         }
 
         if (await IsHealthyAsync(settings.Port))

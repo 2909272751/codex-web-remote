@@ -257,6 +257,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .schema-field input,
 .schema-field select,
 .schema-field textarea,
+.login-card input,
+.toolbar input,
+.search-input,
+.composer textarea,
+.composer select,
+.project-path-row input,
 .project-field input,
 .directory-browser > header,
 .timeline-code,
@@ -264,6 +270,30 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   background: color-mix(in srgb, var(--ui-surface-2) 88%, transparent) !important;
   color: var(--ui-text) !important;
   border-color: var(--ui-line) !important;
+}
+.login-card input::placeholder,
+.toolbar input::placeholder,
+.search-input::placeholder,
+.composer textarea::placeholder,
+.interaction-input::placeholder,
+.schema-field input::placeholder,
+.schema-field textarea::placeholder,
+.project-field input::placeholder,
+.project-path-row input::placeholder {
+  color: var(--ui-muted) !important;
+  opacity: .78;
+}
+input,
+textarea,
+select {
+  caret-color: var(--ui-accent);
+}
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--ui-text) !important;
+  box-shadow: 0 0 0 1000px var(--ui-surface-2) inset !important;
+  caret-color: var(--ui-accent);
 }
 .question-field legend,
 .project-path-row button,

@@ -1,4 +1,4 @@
-# Codex Web Remote v1.4.5
+# Codex Web Remote v1.4.6
 
 ## Web remote parity and setup polish
 
@@ -8,6 +8,10 @@
 - Added clearer launcher access to port/password settings from the dashboard and tray menu.
 - Added account switching support for Codex account backups and safer Web/Desktop restart messaging.
 - Fixed launcher self-test isolation so diagnostics no longer touch the real local settings file.
+- Hardened the Web gateway against uncaught async errors, app-server pipe failures and WebSocket send failures, reducing silent exits and apparent hangs.
+- Made upload preparation available before takeover while still requiring control before sending messages, so remote devices can attach files in advance without interrupting the desktop App.
+- Added attachment ownership checks, malformed filename handling and streaming image previews to avoid cross-session attachment reuse, 500 errors and large-image memory spikes.
+- Improved launcher recovery when the Node gateway process is alive but unhealthy by restarting the gateway instead of reporting a false-ready state.
 - Preserved mobile/tablet/desktop layout fixes, dark/light contrast hardening, account usage snapshots and GitHub update checks.
 
 ---
