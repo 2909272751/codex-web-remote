@@ -81,6 +81,16 @@ try {
   if (!primaryControl.controller || primaryControl.controllerBusy || !primaryControl.sharedWebControl) {
     throw new Error(`First Web session lost shared control: ${JSON.stringify(primaryControl)}`);
   }
+  const emptyDraft = await request("/api/threads", { method: "POST", body: { cwd: root } });
+  await stopServer(child); child = null;
+  child = await startServer();
+  const draftRestartSession = await request("/api/session");
+  if (!draftRestartSession.authenticated) throw new Error("Session did not survive the empty-task recovery restart");
+  await request("/api/control/takeover", { method: "POST", body: {} });
+  const recoveredDraft = await request(`/api/threads/${emptyDraft.thread.id}`);
+  if (recoveredDraft.replacedThreadId !== emptyDraft.thread.id || recoveredDraft.thread?.id === emptyDraft.thread.id || recoveredDraft.thread?.cwd !== root) {
+    throw new Error(`An empty task was not recovered after restart: ${JSON.stringify(recoveredDraft)}`);
+  }
   let accountUsageVerified = true;
   try {
     const accountUsage = await request("/api/account/usage");
@@ -94,6 +104,8 @@ try {
   }
   const created = await request("/api/threads", { method: "POST", body: { cwd: root } });
   const threadId = created.thread.id;
+  const freshThread = await request(`/api/threads/${threadId}`);
+  if (freshThread.thread?.id !== threadId) throw new Error("A newly created empty task could not be opened before its first message");
   let completedCount = 0;
   let replyText = "";
   let sawActivity = false;

@@ -356,7 +356,13 @@ async function previewThread(thread) {
 
 async function openThread(id) {
   const result = await api(`/api/threads/${encodeURIComponent(id)}`);
-  applyThreadResult(result, id);
+  const actualId = result.thread?.id || id;
+  if (result.replacedThreadId) {
+    state.threads = state.threads.filter((thread) => thread.id !== result.replacedThreadId && thread.id !== actualId);
+    state.threads.unshift(result.thread);
+    toast("空任务已恢复，可以继续输入");
+  }
+  applyThreadResult(result, actualId);
   renderThreads(); closeSidebar(); await loadQueue(); updateComposer();
 }
 

@@ -351,9 +351,8 @@ app.get("/api/thread-previews", requireAuth, asyncRoute(async (req, res) => {
 }));
 
 app.get("/api/threads/:id", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
-  const result = testMode
-    ? await codex.request("thread/read", { threadId: req.params.id, includeTurns: false })
-    : await resumeThread(req.params.id) || await codex.request("thread/read", { threadId: req.params.id, includeTurns: true });
+  const result = await resumeThread(req.params.id, { recoverEmpty: true })
+    || await codex.request("thread/read", { threadId: req.params.id, includeTurns: !testMode });
   lastThreadId = req.params.id;
   await mergeThreadCache(result.thread);
   syncThreadRuntime(result.thread);
@@ -612,13 +611,46 @@ function scheduleQueue(threadId, delayMs = 100) {
   queueRetryTimers.set(threadId, timer);
 }
 
-async function resumeThread(threadId) {
+async function resumeThread(threadId, { recoverEmpty = false } = {}) {
   try {
     const result = await codex.request("thread/resume", { threadId, ...(testMode ? { excludeTurns: true } : {}), ...threadPermissionOverrides() });
     syncThreadRuntime(result?.thread);
     return result;
   }
-  catch (error) { if (/no rollout found/i.test(error.message)) return null; throw error; }
+  catch (error) {
+    if (/not materialized yet|includeTurns is unavailable before first user message/i.test(error.message)) {
+      const result = await codex.request("thread/read", { threadId, includeTurns: false });
+      syncThreadRuntime(result?.thread);
+      return result;
+    }
+    if (recoverEmpty && /thread not loaded|no rollout found|thread not found/i.test(error.message)) {
+      try {
+        const result = await codex.request("thread/read", { threadId, includeTurns: false });
+        syncThreadRuntime(result?.thread);
+        return result;
+      } catch { }
+      const recovered = await recoverEmptyThread(threadId);
+      if (recovered) return recovered;
+    }
+    if (/no rollout found/i.test(error.message)) return null;
+    throw error;
+  }
+}
+
+async function recoverEmptyThread(threadId) {
+  const cachedThreads = await loadJson(threadCacheFile, []);
+  const cached = cachedThreads.find((thread) => thread?.id === threadId);
+  if (!cached?.cwd || !/^(未命名任务|untitled|)$/i.test(String(cached.preview || ""))) return null;
+  let stat;
+  try { stat = await fsp.stat(cached.cwd); } catch { return null; }
+  if (!stat.isDirectory()) return null;
+  const replacement = await codex.request("thread/start", { cwd: normalizeProjectPath(cached.cwd), ...(testMode ? { ephemeral: true } : {}), ...threadPermissionOverrides() });
+  if (!replacement.thread?.id) return null;
+  const nextCache = cachedThreads.filter((thread) => thread?.id !== threadId);
+  nextCache.unshift(normalizeThread(replacement.thread));
+  await atomicJson(threadCacheFile, nextCache.sort((left, right) => threadTime(right) - threadTime(left)).slice(0, 100));
+  lastThreadId = replacement.thread.id;
+  return { ...replacement, replacedThreadId: threadId };
 }
 
 async function verifyThreadActive(threadId) {
