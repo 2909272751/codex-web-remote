@@ -17,6 +17,7 @@ internal sealed class MainForm : Form
     private Label? _statusTitle;
     private Label? _statusDetail;
     private Button? _startStop;
+    private Control? _settingsCard;
     private Label? _updateStatus;
     private Button? _updateButton;
     private ReleaseInfo? _latestRelease;
@@ -49,6 +50,7 @@ internal sealed class MainForm : Form
         var menu = new ContextMenuStrip { Font = UiFont };
         menu.Items.Add("打开控制中心", null, (_, _) => SafeShow());
         menu.Items.Add("打开 Web 页面", null, (_, _) => OpenWeb());
+        menu.Items.Add("端口/密码设置", null, (_, _) => SafeShowSettings());
         menu.Items.Add("重启服务", null, async (_, _) => await _server.RestartAsync());
         menu.Items.Add("检查软件更新", null, async (_, _) => { SafeShow(); await CheckForUpdatesAsync(true); });
         menu.Items.Add(new ToolStripSeparator());
@@ -165,8 +167,9 @@ internal sealed class MainForm : Form
         _startStop = SecondaryButton("启动服务");
         _startStop.Click += async (_, _) => { if (_server.State == GatewayState.Running) await _server.StopAsync(); else await _server.StartAsync(); };
         var restart = SecondaryButton("重启"); restart.Click += async (_, _) => await _server.RestartAsync();
+        var security = SecondaryButton("端口/密码"); security.Click += (_, _) => ScrollToSettings();
         var log = SecondaryButton("打开日志"); log.Click += (_, _) => OpenPath(_paths.LogFile);
-        actions.Controls.AddRange([_startStop, restart, log]);
+        actions.Controls.AddRange([_startStop, restart, security, log]);
         statusCard.Controls.Add(_statusTitle); statusCard.Controls.Add(_statusDetail); statusCard.Controls.Add(actions);
         page.Controls.Add(statusCard);
 
@@ -204,6 +207,7 @@ internal sealed class MainForm : Form
         page.Controls.Add(connection);
 
         var preferences = Card();
+        _settingsCard = preferences;
         preferences.Controls.Add(SectionTitle("设置"));
         var password = Input("新密码（留空表示不修改）", true);
         var confirm = Input("确认新密码", true);
@@ -341,6 +345,28 @@ internal sealed class MainForm : Form
     {
         if (IsDisposed) return;
         BeginInvoke(() => { Opacity = 1; ShowInTaskbar = true; Show(); WindowState = FormWindowState.Normal; Activate(); BuildDashboardIfReady(); });
+    }
+
+    public void SafeShowSettings()
+    {
+        if (IsDisposed) return;
+        BeginInvoke(() =>
+        {
+            Opacity = 1;
+            ShowInTaskbar = true;
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
+            BuildDashboardIfReady();
+            ScrollToSettings();
+        });
+    }
+
+    private void ScrollToSettings()
+    {
+        if (_settingsCard is null) return;
+        _content.ScrollControlIntoView(_settingsCard);
+        _settingsCard.Focus();
     }
 
     public void SafeExit()

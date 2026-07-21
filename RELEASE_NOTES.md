@@ -1,3 +1,17 @@
+# Codex Web Remote v1.4.5
+
+## Web remote parity and setup polish
+
+- Restored live desktop-output sync in read-only mode with incremental desktop log forwarding plus debounced snapshot reconciliation.
+- Read-only snapshots now parse newer Codex `response_item` records, including command/tool output, so remote progress is less likely to appear stuck.
+- Added browser-side “remember password” login option for self-hosted personal use.
+- Added clearer launcher access to port/password settings from the dashboard and tray menu.
+- Added account switching support for Codex account backups and safer Web/Desktop restart messaging.
+- Fixed launcher self-test isolation so diagnostics no longer touch the real local settings file.
+- Preserved mobile/tablet/desktop layout fixes, dark/light contrast hardening, account usage snapshots and GitHub update checks.
+
+---
+
 # Codex Web Remote v1.4.4
 
 ## Experience and reliability

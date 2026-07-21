@@ -14,7 +14,7 @@
   <link rel="apple-touch-icon" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css?v=1.4.3-s2">
   <link rel="stylesheet" href="/layout-fix.css?v=1.4.3-s2">
-    <link rel="stylesheet" href="/modern-ui.css?v=1.4.3-ui2">
+    <link rel="stylesheet" href="/modern-ui.css?v=1.4.5-remember1">
 </head>
 <body>
   <section id="loginView" class="center-card hidden">
@@ -22,6 +22,7 @@
       <div class="logo">C</div><span class="eyebrow">PRIVATE AI WORKSPACE</span>
       <h1>欢迎回来</h1><p>安全连接到这台电脑上的 Codex</p>
       <label>访问密码<input id="password" type="password" autocomplete="current-password" minlength="8" required autofocus placeholder="输入访问密码"></label>
+      <label class="remember-row"><input id="rememberPassword" type="checkbox"> <span>记住密码，下次自动填入</span></label>
       <button type="submit">进入工作区 <span>→</span></button><div id="loginError" class="error"></div>
     </form>
   </section>
@@ -42,6 +43,7 @@
         <div id="accountMenu" class="account-menu hidden" role="menu">
           <div class="account-menu-head"><span class="account-chip">AW</span><strong>我的 Codex</strong></div>
           <button id="usageMenuBtn" type="button" role="menuitem"><span>◴</span> 使用情况</button>
+          <button id="switchAccountMenuBtn" type="button" role="menuitem"><span>⇄</span> 切换账号</button>
           <button id="themeMenuBtn" type="button" role="menuitem"><span>◐</span> 外观：跟随系统</button>
           <button id="logoutBtn" type="button" role="menuitem"><span>↪</span> 退出登录</button>
         </div>
@@ -85,6 +87,7 @@
       <div id="toast" class="toast hidden"></div>
     </section>
   </main>
+  <div id="accountSwitchOverlay" class="account-switch-overlay hidden" role="status" aria-live="assertive"><div><i></i><strong>正在切换账号</strong><small>正在安全替换登录信息并重启 Web Codex；请保持此页面打开，约 5 秒后自动重新连接。</small></div></div>
   <div id="usageModal" class="modal-backdrop hidden" role="presentation">
     <section class="usage-dialog" role="dialog" aria-modal="true" aria-labelledby="usageTitle">
       <header><h2 id="usageTitle">使用量</h2><button id="usageCloseBtn" type="button" aria-label="关闭">×</button></header>
@@ -125,6 +128,6 @@
       <footer><button id="projectCancelBtn" type="button">取消</button><button id="projectSaveBtn" type="submit">添加并使用</button></footer>
     </form>
   </div>
-  <script type="module" src="/app.js?v=1.4.3-s2"></script>
+  <script type="module" src="/app.js?v=1.4.5-remember1"></script>
 </body>
 </html>

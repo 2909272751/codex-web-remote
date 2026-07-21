@@ -28,11 +28,13 @@ const sessionFile = path.join(dataDir, "sessions.json");
 const projectFile = path.join(dataDir, "projects.json");
 const controlAuditFile = path.join(dataDir, "control-audit.jsonl");
 const accountUsageHistoryFile = path.join(dataDir, "account-usage-history.json");
+const accountUsageSnapshotFile = path.join(dataDir, "account-usage-snapshot.json");
 const updateRequestFile = process.env.CODEX_WEB_UPDATE_REQUEST_FILE ? path.resolve(process.env.CODEX_WEB_UPDATE_REQUEST_FILE) : "";
+const launcherPath = process.env.CODEX_WEB_LAUNCHER_PATH ? path.resolve(process.env.CODEX_WEB_LAUNCHER_PATH) : "";
 const updateApiUrl = process.env.CODEX_WEB_UPDATE_API || "https://api.github.com/repos/2909272751/codex-web-remote/releases/latest";
 const currentVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0";
 const sessionIndexFile = path.join(process.env.USERPROFILE || root, ".codex", "session_index.jsonl");
-const sessionRoot = path.join(process.env.USERPROFILE || root, ".codex", "sessions");
+const sessionRoot = process.env.CODEX_WEB_SESSION_ROOT ? path.resolve(process.env.CODEX_WEB_SESSION_ROOT) : path.join(process.env.USERPROFILE || root, ".codex", "sessions");
 const uploadDir = process.env.CODEX_WEB_UPLOAD_DIR ? path.resolve(process.env.CODEX_WEB_UPLOAD_DIR) : path.join(process.env.USERPROFILE || root, ".codex", "web-uploads");
 const testMode = process.env.CODEX_WEB_TEST_MODE === "1";
 const testDesktopStateFile = testMode && process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE ? path.resolve(process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE) : "";
@@ -61,6 +63,7 @@ const uploads = new Map();
 const queues = await loadJson(queueFile, {});
 let projectStore = normalizeProjectStore(await loadJson(projectFile, { projects: [], hiddenPaths: [] }));
 let accountUsageHistory = normalizeAccountUsageHistory(await loadJson(accountUsageHistoryFile, { samples: [] }));
+let accountUsageSnapshot = await loadJson(accountUsageSnapshotFile, null);
 const activeTurns = new Map();
 const threadActivities = new Map();
 const threadStatuses = new Map();
@@ -73,6 +76,9 @@ const pendingApprovals = new Map();
 const readonlyThreadCache = new Map();
 const threadSnapshotCache = new Map();
 const readonlyThreadRequests = new Map();
+const desktopLiveFiles = new Map();
+const desktopLivePending = new Map();
+const desktopLiveSnapshotTimers = new Map();
 const threadActivationRequests = new Map();
 const queueWorkers = new Set();
 const queueRetryTimers = new Map();
@@ -89,10 +95,13 @@ let resetCreditInFlight = false;
 let updateCache = null;
 let eventSeq = 0;
 let desktopConflictCheckInFlight = false;
+let desktopSessionWatcher = null;
+let readonlyAccountUsageRequest = null;
 let lastControlAudit = await loadLastJsonLine(controlAuditFile);
 const eventBuffer = [];
 const eventBufferLimit = 1_000;
 const atomicJsonWrites = new Map();
+const resolvedSessionRoot = path.resolve(sessionRoot);
 
 setInterval(cleanup, 60_000).unref();
 setInterval(() => broadcast({ type: "heartbeat", data: { at: Date.now() } }, false), 15_000).unref();
@@ -102,6 +111,8 @@ setInterval(() => { void reconcileDesktopConflict(); }, 5000).unref();
 // deliberately separate from per-turn token events, which only describe work
 // that passed through this gateway.
 setInterval(() => { if (mode === "web" && codex.ready) void sampleAccountUsage(); }, 15 * 60_000).unref();
+setInterval(() => { if (mode === "desktop" && sockets.size) void pollDesktopLiveFiles(); }, 2_500).unref();
+startDesktopLiveWatcher();
 
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -360,12 +371,53 @@ app.get("/api/models", requireAuth, requireWebMode, asyncRoute(async (req, res) 
   res.json(await codex.request("model/list", { includeHidden: false }));
 }));
 
-app.get("/api/account/usage", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
-  const rateLimits = await codex.request("account/rateLimits/read", null);
-  let usage = null;
-  try { usage = await codex.request("account/usage/read", null); } catch { }
-  if (usage) await recordAccountUsageSample(usage);
-  res.json({ rateLimits, usage, history: accountUsageHistory });
+app.get("/api/account/usage", requireAuth, asyncRoute(async (req, res) => {
+  if (mode === "web" && codex.ready) {
+    const rateLimits = await codex.request("account/rateLimits/read", null);
+    let usage = null;
+    try { usage = await codex.request("account/usage/read", null); } catch { }
+    if (usage) await recordAccountUsageSample(usage);
+    await saveAccountUsageSnapshot(rateLimits, usage);
+    return res.json({ rateLimits, usage, history: accountUsageHistory, live: true, cachedAt: accountUsageSnapshot?.cachedAt || Date.now() });
+  }
+  if (!accountUsageSnapshot?.rateLimits) return res.status(409).json({ error: "尚无可显示的额度快照；首次接管后会自动保存，之后可在只读模式查看。" });
+  res.json({ ...accountUsageSnapshot, history: accountUsageHistory, live: false });
+}));
+
+app.get("/api/accounts", requireAuth, asyncRoute(async (req, res) => {
+  const result = await runAccountSwitcher(["--account-switch-list"]);
+  res.json({ profiles: Array.isArray(result.profiles) ? result.profiles : [] });
+}));
+
+app.post("/api/accounts/activate", requireAuth, requireWebMode, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  const profileId = String(req.body?.profileId || "");
+  if (!/^[A-Za-z0-9_-]{6,80}$/.test(profileId)) return res.status(400).json({ error: "账号档案标识无效" });
+  if (transition) return res.status(409).json({ error: "当前正在切换状态，请稍后再试" });
+  const queued = Object.values(queues).reduce((sum, list) => sum + list.length, 0);
+  if (activeTurns.size || threadSubmissions.size || pendingApprovals.size || queued) return res.status(409).json({ error: "请先完成、停止或清空正在运行的任务、审批和排队消息，再切换账号" });
+  transition = true;
+  setTakeoverState("switching-account", "正在切换账号并重启 Web Codex 服务…");
+  broadcastState();
+  try {
+    await codex.stop();
+    const result = await runAccountSwitcher(["--account-switch-activate", profileId]);
+    accountUsageSnapshot = null;
+    accountUsageHistory = { samples: [] };
+    await Promise.all([
+      fsp.rm(accountUsageSnapshotFile, { force: true }),
+      atomicJson(accountUsageHistoryFile, accountUsageHistory),
+    ]);
+    await codex.start();
+    setTakeoverState("ready", "账号已切换，Web Codex 已重新连接");
+    await recordControlAudit("account-switched", req, { profileId });
+    res.json({ ok: true, profile: result.profile || null, reconnectAfterMs: 4500 });
+  } catch (error) {
+    setTakeoverState("failed", error.message || "账号切换失败");
+    throw error;
+  } finally {
+    transition = false;
+    broadcastState();
+  }
 }));
 
 app.post("/api/account/rate-limit-reset", requireAuth, requireWebMode, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -448,7 +500,9 @@ app.post("/api/threads/:id/interrupt", requireAuth, requireController, requireSa
   res.json(await codex.request("turn/interrupt", { threadId: req.params.id, turnId }));
 }));
 
-app.get("/api/threads/:id/queue", requireAuth, requireWebMode, (req, res) => res.json({ data: queues[req.params.id] || [] }));
+// Queue contents are local pending drafts. They are safe to inspect while the
+// desktop owns Codex; only queue mutations still require Web control.
+app.get("/api/threads/:id/queue", requireAuth, (req, res) => res.json({ data: queues[req.params.id] || [] }));
 app.delete("/api/threads/:id/queue/:itemId", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
   queues[req.params.id] = (queues[req.params.id] || []).filter((item) => item.id !== req.params.itemId);
   await saveQueues(); broadcastQueue(req.params.id); res.json({ ok: true });
@@ -797,6 +851,7 @@ async function readReadonlyThread(threadId) {
   let currentTurnId = null;
   let cwd = preview?.cwd || "";
   let model = "";
+  const responseCallItems = new Map();
   const stream = fs.createReadStream(file, { encoding: "utf8" });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
   const ensureTurn = (id) => {
@@ -816,12 +871,16 @@ async function readReadonlyThread(threadId) {
       ensureTurn(currentTurnId);
       continue;
     }
+    if (record.type === "response_item") {
+      appendReadonlyResponseItem(ensureTurn(currentTurnId), payload, responseCallItems);
+      continue;
+    }
     if (record.type !== "event_msg") continue;
     if (payload.type === "task_started") { currentTurnId = payload.turn_id || currentTurnId; ensureTurn(currentTurnId); continue; }
     const turn = ensureTurn(payload.turn_id || currentTurnId);
-    if (payload.type === "user_message") turn.items.push({ type: "userMessage", content: [{ type: "text", text: payload.message || "" }] });
-    else if (payload.type === "agent_message") turn.items.push({ type: "agentMessage", text: payload.message || "", phase: payload.phase });
-    else if (payload.type === "agent_reasoning") turn.items.push({ type: "reasoning", summary: payload.text || "", status: "completed" });
+    if (payload.type === "user_message") appendReadonlyItem(turn, { type: "userMessage", content: [{ type: "text", text: payload.message || "" }] });
+    else if (payload.type === "agent_message") appendReadonlyItem(turn, { type: "agentMessage", text: payload.message || "", phase: payload.phase });
+    else if (payload.type === "agent_reasoning") appendReadonlyItem(turn, { type: "reasoning", summary: payload.text || "", status: "completed" });
   }
   const thread = { id: threadId, preview: preview?.preview || "未命名任务", cwd, model, turns };
   readonlyThreadCache.set(threadId, { size: stat.size, mtimeMs: stat.mtimeMs, thread });
@@ -833,6 +892,70 @@ function readReadonlyThreadSingleFlight(threadId) {
   const request = readReadonlyThread(threadId).finally(() => readonlyThreadRequests.delete(threadId));
   readonlyThreadRequests.set(threadId, request);
   return request;
+}
+
+function appendReadonlyItem(turn, item) {
+  if (!turn || !item?.type) return null;
+  if (item.id && turn.items.some((entry) => String(entry.id || "") === String(item.id))) return null;
+  const previous = turn.items.at(-1);
+  if (item.type === "agentMessage" && previous?.type === "agentMessage" && String(previous.text || "") === String(item.text || "")) return previous;
+  if (item.type === "reasoning" && previous?.type === "reasoning" && String(previous.summary || "") === String(item.summary || "")) return previous;
+  turn.items.push(item);
+  return item;
+}
+
+function appendReadonlyResponseItem(turn, payload = {}, callItems = new Map()) {
+  const id = String(payload.id || payload.call_id || crypto.randomUUID());
+  if (payload.type === "message" && payload.role === "assistant") {
+    const text = responseContentText(payload);
+    if (text) appendReadonlyItem(turn, { id, type: "agentMessage", text, phase: payload.phase });
+    return;
+  }
+  if (payload.type === "reasoning") {
+    const summary = responseReasoningText(payload);
+    if (summary) appendReadonlyItem(turn, { id, type: "reasoning", summary, status: "completed" });
+    return;
+  }
+  if (payload.type === "function_call") {
+    const args = parseMaybeJson(payload.arguments);
+    const item = payload.name === "shell_command"
+      ? { id, type: "commandExecution", command: args.command || args.cmd || String(payload.arguments || payload.name || ""), cwd: args.workdir || args.cwd || "", status: "inProgress", aggregatedOutput: "" }
+      : { id, type: "dynamicToolCall", namespace: "desktop", tool: payload.name || "tool", arguments: args, status: "inProgress", contentItems: [] };
+    appendReadonlyItem(turn, item);
+    if (payload.call_id) callItems.set(String(payload.call_id), item);
+    return;
+  }
+  if (payload.type === "function_call_output") {
+    const item = payload.call_id ? callItems.get(String(payload.call_id)) : null;
+    const output = String(payload.output || "");
+    if (item?.type === "commandExecution") {
+      item.status = "completed";
+      item.aggregatedOutput = output || item.aggregatedOutput || "";
+    } else if (item?.type === "dynamicToolCall") {
+      item.status = "completed";
+      item.contentItems = output ? [{ type: "text", text: output }] : item.contentItems || [];
+    } else if (output) {
+      appendReadonlyItem(turn, { id, type: "dynamicToolCall", namespace: "desktop", tool: "output", status: "completed", contentItems: [{ type: "text", text: output }] });
+    }
+  }
+}
+
+function responseContentText(payload = {}) {
+  return (Array.isArray(payload.content) ? payload.content : [])
+    .map((entry) => entry?.text || entry?.output_text || "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+function responseReasoningText(payload = {}) {
+  if (typeof payload.text === "string") return payload.text;
+  if (Array.isArray(payload.summary)) return payload.summary.map((entry) => entry?.text || entry?.summary || "").filter(Boolean).join("\n");
+  return "";
+}
+
+function parseMaybeJson(value) {
+  if (!value || typeof value !== "string") return value && typeof value === "object" ? value : {};
+  try { return JSON.parse(value); } catch { return { raw: value }; }
 }
 
 async function findSessionFile(threadId) {
@@ -849,6 +972,240 @@ async function findSessionFile(threadId) {
     }
   }
   return null;
+}
+
+// Desktop Codex writes its conversation to JSONL while it is running.  Watch
+// those append-only files and forward only newly appended records; repeatedly
+// reparsing a multi-megabyte session on every token would make the Web UI slow.
+function startDesktopLiveWatcher() {
+  if (desktopSessionWatcher || testMode) return;
+  try {
+    desktopSessionWatcher = fs.watch(sessionRoot, { recursive: true }, (_event, name) => {
+      const relative = Buffer.isBuffer(name) ? name.toString("utf8") : String(name || "");
+      if (!relative.endsWith(".jsonl")) return;
+      queueDesktopLiveFile(resolveSessionFile(relative));
+    });
+    desktopSessionWatcher.on("error", () => { try { desktopSessionWatcher?.close(); } catch { } desktopSessionWatcher = null; });
+    void primeDesktopLiveFiles();
+  } catch {
+    // A later desktop launch may create the directory; retrying is cheap and
+    // avoids making the gateway startup depend on Codex having run before.
+    setTimeout(startDesktopLiveWatcher, 5_000).unref();
+  }
+}
+
+async function primeDesktopLiveFiles() {
+  const files = [];
+  const stack = [sessionRoot];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const target = path.join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(target);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        try { files.push({ file: target, mtimeMs: (await fsp.stat(target)).mtimeMs }); } catch { }
+      }
+    }
+  }
+  files.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  await Promise.all(files.slice(0, 12).map(({ file }) => initializeDesktopLiveFile(file)));
+}
+
+async function pollDesktopLiveFiles() {
+  const files = [];
+  const stack = [sessionRoot];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const target = path.join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(target);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        try { files.push({ file: target, mtimeMs: (await fsp.stat(target)).mtimeMs }); } catch { }
+      }
+    }
+  }
+  files.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  await Promise.all(files.slice(0, 4).map(({ file }) => syncDesktopLiveFile(file)));
+}
+
+function queueDesktopLiveFile(file) {
+  if (mode !== "desktop" || !sockets.size || !isSessionFile(file)) return;
+  clearTimeout(desktopLivePending.get(file));
+  desktopLivePending.set(file, setTimeout(() => {
+    desktopLivePending.delete(file);
+    void syncDesktopLiveFile(file);
+  }, 120));
+}
+
+async function initializeDesktopLiveFile(file) {
+  const stat = await fsp.stat(file);
+  const state = { offset: stat.size, carry: "", threadId: sessionThreadId(file), turnId: "", lastAgent: "", lastReasoning: "", touchedAt: Date.now() };
+  desktopLiveFiles.set(file, state);
+  // Establish text baselines from a small tail so desktop records that repeat
+  // the accumulated answer become a delta rather than duplicated Web text.
+  const bytes = Math.min(stat.size, 192 * 1024);
+  if (!bytes) return state;
+  const handle = await fsp.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(bytes);
+    await handle.read(buffer, 0, bytes, stat.size - bytes);
+    for (const line of buffer.toString("utf8").split(/\r?\n/)) {
+      try { updateDesktopLiveBaseline(state, JSON.parse(line)); } catch { }
+    }
+  } finally { await handle.close(); }
+  return state;
+}
+
+async function syncDesktopLiveFile(file) {
+  let stat;
+  try { stat = await fsp.stat(file); } catch { return; }
+  let state = desktopLiveFiles.get(file);
+  if (!state) {
+    state = await initializeDesktopLiveFile(file);
+    const thread = state.threadId ? await readReadonlyThread(state.threadId) : null;
+    if (thread) broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "snapshot", thread } });
+    return;
+  }
+  if (stat.size < state.offset) { state = await initializeDesktopLiveFile(file); return; }
+  const length = stat.size - state.offset;
+  if (!length) return;
+  const readLength = Math.min(length, 2 * 1024 * 1024);
+  // In the unlikely event of a very large missed write, retain the newest part
+  // and resync from the on-disk snapshot when the turn completes.
+  const start = length > readLength ? stat.size - readLength : state.offset;
+  const handle = await fsp.open(file, "r");
+  let text;
+  try {
+    const buffer = Buffer.alloc(readLength);
+    const { bytesRead } = await handle.read(buffer, 0, readLength, start);
+    text = buffer.subarray(0, bytesRead).toString("utf8");
+  } finally { await handle.close(); }
+  state.offset = stat.size;
+  state.touchedAt = Date.now();
+  const lines = `${start > state.offset - length ? "" : state.carry}${text}`.split(/\r?\n/);
+  state.carry = lines.pop() || "";
+  let sawRecord = false;
+  for (const line of lines) {
+    try { sawRecord = forwardDesktopLiveRecord(state, JSON.parse(line)) || sawRecord; } catch { }
+  }
+  if (sawRecord) scheduleDesktopLiveSnapshot(state.threadId);
+}
+
+function sessionThreadId(file) {
+  const match = path.basename(file).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+  return match?.[1] || "";
+}
+
+function resolveSessionFile(file) {
+  if (!file) return "";
+  const resolved = path.resolve(path.isAbsolute(file) ? file : path.join(sessionRoot, file));
+  return isSessionFile(resolved) ? resolved : "";
+}
+
+function isSessionFile(file) {
+  if (!file || !String(file).endsWith(".jsonl")) return false;
+  const resolved = path.resolve(file);
+  const rootKey = `${resolvedSessionRoot.toLowerCase()}${path.sep}`;
+  const fileKey = resolved.toLowerCase();
+  return fileKey === resolvedSessionRoot.toLowerCase() || fileKey.startsWith(rootKey);
+}
+
+function scheduleDesktopLiveSnapshot(threadId, delayMs = 900) {
+  if (mode !== "desktop" || !sockets.size || !threadId) return;
+  clearTimeout(desktopLiveSnapshotTimers.get(threadId));
+  const timer = setTimeout(async () => {
+    desktopLiveSnapshotTimers.delete(threadId);
+    if (mode !== "desktop" || !sockets.size) return;
+    try {
+      const thread = await readReadonlyThreadSingleFlight(threadId);
+      if (thread) {
+        void writeThreadSnapshot(thread).catch(() => {});
+        broadcast({ type: "desktopLive", data: { threadId, kind: "snapshot", thread } });
+      }
+    } catch { }
+  }, delayMs);
+  timer.unref();
+  desktopLiveSnapshotTimers.set(threadId, timer);
+}
+
+function updateDesktopLiveBaseline(state, record) {
+  const payload = record?.payload || {};
+  if (record?.type === "response_item") {
+    if (payload.type === "message" && payload.role === "assistant") state.lastAgent = responseContentText(payload) || state.lastAgent;
+    return;
+  }
+  if (record?.type !== "event_msg") return;
+  if (payload.type === "task_started") state.turnId = payload.turn_id || state.turnId;
+  if (payload.type === "agent_message") state.lastAgent = String(payload.message || state.lastAgent);
+  if (payload.type === "agent_reasoning") state.lastReasoning = String(payload.text || state.lastReasoning);
+}
+
+function desktopTextDelta(state, field, value) {
+  const next = String(value || "");
+  const previous = String(state[field] || "");
+  state[field] = next;
+  if (!next || next === previous) return "";
+  return next.startsWith(previous) ? next.slice(previous.length) : (previous ? `\n${next}` : next);
+}
+
+function forwardDesktopLiveRecord(state, record) {
+  if (mode !== "desktop" || !state.threadId) return false;
+  if (record?.type === "response_item") return forwardDesktopResponseItem(state, record.payload || {});
+  if (record?.type !== "event_msg") return false;
+  const payload = record.payload || {};
+  const turnId = payload.turn_id || state.turnId || `desktop-${state.threadId}`;
+  if (payload.type === "task_started") {
+    state.turnId = payload.turn_id || turnId;
+    broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "turnStarted", turnId: state.turnId } });
+    return true;
+  }
+  if (payload.type === "user_message") {
+    broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "user", itemId: `desktop:${turnId}:user`, text: String(payload.message || "") } });
+    return true;
+  }
+  if (payload.type === "agent_reasoning") {
+    const delta = desktopTextDelta(state, "lastReasoning", payload.text);
+    if (delta) broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "reasoning", itemId: `desktop:${turnId}:reasoning`, delta } });
+    return true;
+  }
+  if (payload.type === "agent_message") {
+    const delta = desktopTextDelta(state, "lastAgent", payload.message);
+    if (delta) broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "agent", itemId: `desktop:${turnId}:agent`, delta } });
+    return true;
+  }
+  if (payload.type === "task_complete") {
+    state.turnId = "";
+    broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "turnCompleted", turnId } });
+    return true;
+  }
+  return false;
+}
+
+function forwardDesktopResponseItem(state, payload = {}) {
+  const turnId = state.turnId || `desktop-${state.threadId}`;
+  if (payload.type === "message" && payload.role === "assistant") {
+    const delta = desktopTextDelta(state, "lastAgent", responseContentText(payload));
+    if (delta) broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "agent", itemId: `desktop:${turnId}:agent`, delta } });
+    return true;
+  }
+  if (payload.type === "reasoning") {
+    broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "activity", phase: "thinking", label: "桌面 App 正在思考" } });
+    return true;
+  }
+  if (payload.type === "function_call") {
+    const label = payload.name === "shell_command" ? "桌面 App 正在执行命令" : "桌面 App 正在调用工具";
+    broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "activity", phase: payload.name === "shell_command" ? "command" : "tool", label } });
+    return true;
+  }
+  if (payload.type === "function_call_output") {
+    broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "activity", phase: "working", label: "桌面 App 输出已更新" } });
+    return true;
+  }
+  return false;
 }
 
 function normalizeThread(thread) {
@@ -933,6 +1290,10 @@ async function recordAccountUsageSample(usage) {
   accountUsageHistory.samples.push({ at: Date.now(), day: today, tokens });
   accountUsageHistory.samples = accountUsageHistory.samples.filter((item) => item.at >= Date.now() - 45 * 86400_000).slice(-2_000);
   await atomicJson(accountUsageHistoryFile, accountUsageHistory);
+}
+async function saveAccountUsageSnapshot(rateLimits, usage) {
+  accountUsageSnapshot = { rateLimits, usage, cachedAt: Date.now() };
+  await atomicJson(accountUsageSnapshotFile, accountUsageSnapshot);
 }
 function tokenValue(value, keys) {
   const queue = [value]; const seen = new Set();
@@ -1248,6 +1609,16 @@ async function launchDesktop(threadId) {
 
 function runPowerShell(script) {
   return new Promise((resolve, reject) => execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+}
+
+function runAccountSwitcher(args) {
+  if (!launcherPath || !fs.existsSync(launcherPath)) return Promise.reject(new Error("账号切换仅在已安装的 Windows 版网关中可用"));
+  return new Promise((resolve, reject) => execFile(launcherPath, args, { windowsHide: true, timeout: 15_000, maxBuffer: 256 * 1024 }, (error, stdout) => {
+    let result = null;
+    try { result = JSON.parse(String(stdout || "{}")); } catch { /* fall through to safe generic error */ }
+    if (error || !result?.ok) return reject(new Error(result?.error || "账号切换工具执行失败"));
+    resolve(result);
+  }));
 }
 
 async function latestRelease(force = false) {

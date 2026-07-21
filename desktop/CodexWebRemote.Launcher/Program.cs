@@ -24,6 +24,11 @@ internal static class Program
             Environment.ExitCode = RunSelfTest();
             return;
         }
+        if (args.Contains("--account-switch-list", StringComparer.OrdinalIgnoreCase) || args.Contains("--account-switch-activate", StringComparer.OrdinalIgnoreCase))
+        {
+            Environment.ExitCode = AccountSwitcher.Run(args);
+            return;
+        }
         if (args.Contains("--ui-snapshot", StringComparer.OrdinalIgnoreCase))
         {
             RunUiSnapshot();
@@ -66,6 +71,8 @@ internal static class Program
     {
         try
         {
+            var stateRoot = Path.Combine(Path.GetTempPath(), "CodexWebRemote.SelfTest", Guid.NewGuid().ToString("N"));
+            Environment.SetEnvironmentVariable("CODEX_WEB_STATE_ROOT", stateRoot);
             var paths = new AppPaths();
             var config = new ConfigStore(paths);
             var port = int.TryParse(Environment.GetEnvironmentVariable("CODEX_WEB_SELF_TEST_PORT"), out var parsed) ? parsed : 18992;

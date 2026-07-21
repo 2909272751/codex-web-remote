@@ -5,13 +5,13 @@
   --ui-surface-2: #f8f9fc;
   --ui-elevated: rgba(255, 255, 255, .92);
   --ui-text: #1f2430;
-  --ui-muted: #7f8796;
+  --ui-muted: #626b7a;
   --ui-line: #e5e8f0;
   --ui-accent: #6757e8;
   --ui-accent-2: #9274f4;
   --ui-success: #20a879;
   --ui-warn: #c78628;
-  --ui-danger: #d85b67;
+  --ui-danger: #bd3748;
   --ui-shadow: 0 16px 44px rgba(32, 40, 75, .09);
   --ui-radius-sm: 10px;
   --ui-radius-md: 14px;
@@ -52,6 +52,8 @@ button:not(:disabled):hover { transform: translateY(-1px); }
 button:not(:disabled):active { transform: translateY(0) scale(.98); }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 3px solid color-mix(in srgb, var(--ui-accent) 28%, transparent); outline-offset: 2px; }
 .nav-action, .thread, .project-item, .account-button { border-radius: var(--ui-radius-sm); }
+.login-card .remember-row { display: flex; align-items: center; gap: 9px; margin-top: 12px; color: var(--ui-muted); font-size: 13px; }
+.login-card .remember-row input { width: 18px; height: 18px; flex: 0 0 auto; padding: 0; accent-color: var(--ui-accent); }
 .nav-action:hover, .thread:hover, .project-item:hover { background: color-mix(in srgb, var(--ui-accent) 8%, var(--ui-surface)); }
 .thread.active, .project-item.active { background: color-mix(in srgb, var(--ui-accent) 13%, var(--ui-surface)); color: var(--ui-accent); box-shadow: inset 3px 0 var(--ui-accent); }
 .toolbar input, .search-input, .project-field input, .interaction-input, .composer textarea, .composer select { background: var(--ui-surface-2); color: var(--ui-text); border-color: var(--ui-line); }
@@ -80,6 +82,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .timeline-card { animation: ui-pop .2s ease both; }
 .status-chip, .queue-count { border-radius: 999px; }
 .modal-backdrop { background: rgba(14, 18, 28, .42); backdrop-filter: blur(5px); }
+.account-switch-overlay { position: fixed; z-index: 300; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(14, 18, 28, .56); backdrop-filter: blur(10px); }
+.account-switch-overlay > div { width: min(390px, 100%); display: grid; justify-items: center; gap: 12px; padding: 30px; border: 1px solid color-mix(in srgb, white 35%, transparent); border-radius: 24px; background: color-mix(in srgb, var(--ui-surface) 94%, transparent); box-shadow: var(--ui-shadow); text-align: center; animation: ui-pop .24s ease both; }
+.account-switch-overlay i { width: 32px; height: 32px; border: 3px solid color-mix(in srgb, var(--ui-accent) 25%, transparent); border-top-color: var(--ui-accent); border-radius: 50%; animation: account-spin .8s linear infinite; }
+.account-switch-overlay strong { color: var(--ui-text); font-size: 18px; }.account-switch-overlay small { color: var(--ui-muted); line-height: 1.6; } @keyframes account-spin { to { transform: rotate(360deg); } }
 .usage-dialog, .project-dialog, .account-menu { background: var(--ui-surface); color: var(--ui-text); border-color: var(--ui-line); box-shadow: var(--ui-shadow); }
 .update-banner { background: color-mix(in srgb, var(--ui-accent) 9%, var(--ui-surface)); border-color: color-mix(in srgb, var(--ui-accent) 22%, var(--ui-line)); }
 .usage-timeline { display: grid; gap: 12px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--ui-line); }
@@ -113,4 +119,437 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+
+/* Theme contrast hardening for legacy panels that still carry fixed colors. */
+.toast,
+.account-menu,
+.account-menu button,
+.usage-dialog,
+.usage-dialog h2,
+.usage-card,
+.usage-card strong,
+.usage-stats strong,
+.project-dialog,
+.project-dialog h2,
+.project-field,
+.directory-entry,
+.interaction-heading strong,
+.question-field p,
+.choice-option strong,
+.schema-field,
+.timeline-card,
+.timeline-heading strong,
+.file-change,
+.file-change code {
+  color: var(--ui-text);
+}
+.toast,
+.account-menu,
+.usage-dialog,
+.project-dialog,
+.bottom-stack .approval,
+.queue-panel,
+.approval,
+.timeline-card {
+  background: var(--ui-elevated);
+  border-color: var(--ui-line);
+}
+.toast {
+  border-color: color-mix(in srgb, var(--ui-line) 82%, transparent);
+  box-shadow: var(--ui-shadow);
+}
+.account-menu-head,
+.timeline-body,
+.directory-browser > header,
+.file-change > summary,
+.file-change > .timeline-diff {
+  border-color: var(--ui-line) !important;
+}
+.account-menu button:hover,
+.project-all:hover,
+.project-all.active,
+.project-item:hover,
+.project-item.active,
+.directory-entry:hover,
+.choice-option:has(input:checked),
+.timeline-card > summary:hover,
+.project-section-label button:hover {
+  background: color-mix(in srgb, var(--ui-accent) 12%, var(--ui-surface));
+  color: var(--ui-accent);
+}
+.account-menu button span,
+.account-chevron,
+.usage-loading,
+.usage-card small,
+.usage-meter b,
+.usage-stats small,
+.project-dialog > header p,
+.project-field small,
+.directory-browser > header strong,
+.directory-empty,
+.project-choose small,
+.thread-list-empty,
+.interaction-heading small,
+.choice-option small,
+.timeline-heading small,
+.timeline-body h4,
+.timeline-meta,
+.timeline-muted,
+.timeline-progress-list,
+.file-change > summary small,
+.plan-step {
+  color: var(--ui-muted);
+}
+.usage-card,
+.usage-stats > div,
+.directory-browser,
+.directory-entry,
+.question-field,
+.choice-option,
+.file-change {
+  background: color-mix(in srgb, var(--ui-surface-2) 78%, transparent);
+  border-color: var(--ui-line);
+}
+.usage-dialog > header button,
+.project-dialog > header > button,
+.sidebar-close,
+.attachment-actions button,
+.project-remove,
+.ghost,
+.icon-button,
+.permission-shortcut,
+.mobile-tools-btn {
+  background: color-mix(in srgb, var(--ui-surface-2) 88%, transparent);
+  color: var(--ui-muted);
+  border-color: var(--ui-line);
+}
+.usage-dialog > header button:hover,
+.project-dialog > header > button:hover,
+.project-remove:hover,
+.ghost:hover,
+.icon-button:hover,
+.permission-shortcut:hover,
+.mobile-tools-btn:hover {
+  background: color-mix(in srgb, var(--ui-accent) 11%, var(--ui-surface));
+  color: var(--ui-accent);
+}
+.usage-meter > span,
+.attachment-progress {
+  background: var(--ui-line);
+}
+.usage-meter i {
+  background: var(--ui-text);
+}
+.usage-message {
+  color: var(--ui-accent);
+}
+.reset-card > button {
+  background: color-mix(in srgb, var(--ui-success) 18%, var(--ui-surface));
+  color: var(--ui-success);
+}
+.reset-card > button:disabled {
+  background: color-mix(in srgb, var(--ui-muted) 15%, var(--ui-surface));
+  color: var(--ui-muted);
+}
+.interaction-detail,
+.interaction-input,
+.schema-field input,
+.schema-field select,
+.schema-field textarea,
+.project-field input,
+.directory-browser > header,
+.timeline-code,
+.timeline-diff {
+  background: color-mix(in srgb, var(--ui-surface-2) 88%, transparent) !important;
+  color: var(--ui-text) !important;
+  border-color: var(--ui-line) !important;
+}
+.question-field legend,
+.project-path-row button,
+.directory-browser header button,
+.project-dialog > footer button,
+.elicitation-link,
+.history-more {
+  background: color-mix(in srgb, var(--ui-accent) 11%, var(--ui-surface));
+  color: var(--ui-accent);
+}
+.timeline-text,
+.plan-text,
+.reasoning-content {
+  color: color-mix(in srgb, var(--ui-text) 82%, var(--ui-muted));
+}
+.timeline-status,
+.file-kind,
+.thread-queue {
+  background: color-mix(in srgb, var(--ui-muted) 14%, var(--ui-surface));
+  color: var(--ui-muted);
+}
+.timeline-status.in-progress,
+.file-kind.update {
+  background: color-mix(in srgb, var(--ui-accent) 16%, var(--ui-surface));
+  color: var(--ui-accent);
+}
+.timeline-status.failed,
+.timeline-error,
+.file-kind.delete,
+.project-error,
+.security-warning,
+.error {
+  background: color-mix(in srgb, var(--ui-danger) 12%, var(--ui-surface));
+  color: var(--ui-danger);
+}
+.timeline-status.declined {
+  background: color-mix(in srgb, var(--ui-warn) 14%, var(--ui-surface));
+  color: var(--ui-warn);
+}
+.timeline-status.pending {
+  background: color-mix(in srgb, var(--ui-muted) 14%, var(--ui-surface));
+  color: var(--ui-muted);
+}
+.file-kind.add,
+.plan-step.completed {
+  background: color-mix(in srgb, var(--ui-success) 14%, var(--ui-surface));
+  color: var(--ui-success);
+}
+.plan-step.inProgress {
+  color: var(--ui-accent);
+}
+.timeline-tool-image {
+  background: var(--ui-surface);
+  border-color: var(--ui-line);
+}
+.bottom-stack {
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--ui-surface) 96%, transparent) 16px);
+}
+@media (max-width: 820px) {
+  body { background: var(--ui-bg); }
+  .bottom-stack {
+    background: linear-gradient(180deg, transparent, var(--ui-surface) 10px);
+  }
+  .composer {
+    background: var(--ui-elevated);
+  }
+}
+
+/* Mobile adaptive allocation: keep header, content, and composer balanced. */
+@media (max-width: 820px) {
+  :root {
+    --mobile-edge: max(10px, env(safe-area-inset-left));
+    --mobile-edge-r: max(10px, env(safe-area-inset-right));
+    --mobile-bottom: max(8px, env(safe-area-inset-bottom));
+  }
+  .app,
+  .chat-shell {
+    width: 100vw;
+    overflow: hidden;
+  }
+  .chat-shell {
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+  }
+  .control-bar {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 6px var(--mobile-edge-r) 6px var(--mobile-edge);
+    gap: 6px;
+  }
+  .control-spark {
+    display: none;
+  }
+  #controlText {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .control-actions {
+    min-width: 0;
+    display: flex;
+    justify-content: flex-end;
+    gap: 5px;
+  }
+  .control-actions button {
+    min-height: 34px;
+    max-width: 34vw;
+    padding: 6px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chat-header {
+    min-height: 58px;
+    height: auto;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    padding: 8px var(--mobile-edge-r) 8px var(--mobile-edge);
+    gap: 8px;
+  }
+  .chat-heading {
+    max-width: none;
+  }
+  .chat-header small {
+    max-width: 100%;
+  }
+  .activity {
+    position: static;
+    transform: none;
+    max-width: 32vw;
+    min-height: 34px;
+    justify-self: end;
+    padding: 5px 8px;
+    box-shadow: none;
+  }
+  .activity:not(.hidden) + .danger {
+    display: none;
+  }
+  .messages {
+    min-height: 0;
+    padding: 18px var(--mobile-edge-r) 12px var(--mobile-edge);
+  }
+  .message {
+    font-size: 14px;
+    line-height: 1.62;
+  }
+  .message.user {
+    max-width: min(92%, 620px);
+  }
+  .bottom-stack {
+    max-height: min(58dvh, 430px);
+    padding: 0 var(--mobile-edge-r) var(--mobile-bottom) var(--mobile-edge);
+    gap: 6px;
+    overflow: hidden;
+  }
+  .bottom-stack .queue-panel,
+  .bottom-stack .approval {
+    width: 100%;
+    max-height: min(28dvh, 210px);
+  }
+  .bottom-stack .attachment-tray,
+  .bottom-stack .composer {
+    width: 100%;
+  }
+  .attachment {
+    min-width: min(180px, 74vw);
+  }
+  .composer {
+    margin: 0;
+    padding: 10px;
+    border-radius: 18px;
+    grid-template-columns: minmax(0, 1fr) 42px;
+    grid-template-rows: auto 38px auto;
+    gap: 8px;
+  }
+  .composer textarea {
+    min-height: 44px;
+    max-height: min(22dvh, 132px);
+    line-height: 1.45;
+  }
+  .left-tools {
+    min-width: 0;
+    overflow: hidden;
+  }
+  .permission-shortcut {
+    max-width: min(34vw, 132px);
+  }
+  .right-tools {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+  }
+  .right-tools.open {
+    max-height: min(24dvh, 156px);
+    overflow-y: auto;
+  }
+  .right-tools label {
+    min-width: 0;
+  }
+  .composer select {
+    min-height: 36px;
+  }
+  .composer #sendBtn {
+    width: 42px;
+    height: 42px;
+    align-self: center;
+  }
+  .new-messages {
+    bottom: calc(var(--mobile-bottom) + 116px);
+  }
+  .toast {
+    bottom: calc(var(--mobile-bottom) + 116px);
+  }
+  .sidebar {
+    width: min(92vw, 380px);
+    max-width: calc(100vw - 18px);
+  }
+  .sidebar header {
+    height: 62px;
+    padding-inline: 14px;
+  }
+  .project-list,
+  .thread-list {
+    overscroll-behavior: contain;
+  }
+  .modal-backdrop {
+    padding-top: env(safe-area-inset-top);
+  }
+  .usage-dialog,
+  .project-dialog {
+    max-height: min(92dvh, calc(var(--app-height, 100dvh) - 18px));
+  }
+}
+@media (min-width: 481px) and (max-width: 820px) {
+  .bottom-stack {
+    max-width: 720px;
+    margin-inline: auto;
+    width: 100%;
+  }
+  .messages {
+    padding-inline: max(18px, calc((100vw - 720px) / 2));
+  }
+}
+@media (max-width: 430px) {
+  .control-actions button {
+    max-width: 29vw;
+  }
+  .chat-header {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .activity {
+    grid-column: 1 / -1;
+    justify-self: center;
+    max-width: calc(100vw - 22px);
+    width: max-content;
+  }
+  .activity.hidden + .danger,
+  .activity:not(.hidden) + .danger {
+    display: none;
+  }
+  .composer {
+    border-radius: 16px;
+  }
+}
+@media (max-width: 360px) {
+  .control-bar {
+    grid-template-columns: 1fr;
+  }
+  .control-actions {
+    justify-content: stretch;
+  }
+  .control-actions button {
+    flex: 1 1 0;
+    max-width: none;
+  }
+  .right-tools {
+    grid-template-columns: 1fr;
+  }
+  .right-tools.open {
+    max-height: min(32dvh, 210px);
+  }
+  .attach {
+    width: 38px;
+    padding-inline: 0;
+  }
+  .permission-shortcut {
+    max-width: 30vw;
+  }
 }

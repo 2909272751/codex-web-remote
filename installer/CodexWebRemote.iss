@@ -2,7 +2,7 @@
   #error StageDir must be provided by build-installer.ps1
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "1.4.4"
+  #define MyAppVersion "1.4.5"
 #endif
 #ifndef ChineseLanguageFile
   #error ChineseLanguageFile must be provided by build-installer.ps1

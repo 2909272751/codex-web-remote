@@ -30,12 +30,18 @@ const checks = {
 checks.modern_ui_layer_is_loaded = html.includes("/modern-ui.css") && modern.includes("--ui-accent");
 checks.theme_toggle_is_persistent = app.includes("codex-web-theme") && app.includes("document.documentElement.dataset.theme");
 checks.modern_ui_supports_reduced_motion = modern.includes("prefers-reduced-motion: reduce");
+checks.theme_dialog_text_contrast_is_hardened = modern.includes("Theme contrast hardening") && modern.includes(".toast,") && modern.includes("color: var(--ui-text)") && modern.includes(".interaction-detail") && modern.includes(".usage-card") && modern.includes(".project-dialog");
+checks.mobile_layout_allocates_space = modern.includes("Mobile adaptive allocation") && modern.includes("max-height: min(58dvh, 430px)") && modern.includes("max-height: min(24dvh, 156px)") && modern.includes("grid-template-columns: auto minmax(0, 1fr) auto") && html.includes("1.4.5-remember1");
+checks.login_can_remember_password = html.includes('id="rememberPassword"') && app.includes("REMEMBER_PASSWORD_KEY") && app.includes("restoreRememberedPassword") && app.includes("saveRememberedPassword");
 checks.snapshot_sync_is_bounded = app.includes("snapshotTimer") && app.includes("10_000") && server.includes("readReadonlyThreadSingleFlight");
 checks.readonly_mode_uses_snapshots = app.includes("/api/threads/${encodeURIComponent(thread.id)}/snapshot") && app.includes("readonly-mode");
 checks.long_history_has_bounded_dom = app.includes("HISTORY_DOM_LIMIT") && app.includes("trimHistoryWindow") && app.includes("renderLaterHistory");
 checks.uploads_have_progress_and_recovery = app.includes("XMLHttpRequest") && app.includes("retryUpload") && app.includes("codex-web-draft:");
 checks.shared_control_state_is_visible = app.includes("webClientCount") && html.includes('id="controlMeta"') && server.includes("sharedWebControl");
 checks.account_token_usage_has_source_boundaries = html.includes('id="usageHourTokens"') && app.includes("renderAccountTokenTimeline") && server.includes("recordObservedTokenUsage") && server.includes("accountUsageHistory");
+checks.readonly_usage_uses_last_official_snapshot = app.includes("payload.live === false") && server.includes("accountUsageSnapshot") && !server.includes('app.get("/api/account/usage", requireAuth, requireWebMode');
+checks.account_switch_restarts_safely = html.includes('id="switchAccountMenuBtn"') && app.includes("switchAccount") && server.includes('"/api/accounts/activate"') && server.includes("runAccountSwitcher");
+checks.desktop_output_is_incrementally_streamed = server.includes("desktopLive") && server.includes("syncDesktopLiveFile") && app.includes("applyDesktopLiveEvent");
 checks.reconnect_restores_task_and_uses_bounded_backoff = app.includes("restoreLastThread") && app.includes("codex-web-last-thread") && app.includes("500 * 2 ** state.reconnectCount") && app.includes("navigator.onLine !== false");
 
 const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);

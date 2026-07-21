@@ -20,6 +20,7 @@ const $ = (id) => document.getElementById(id);
 const HISTORY_BATCH_SIZE = 80;
 const HISTORY_DOM_LIMIT = 240;
 const THREAD_VIEW_LIMIT = 8;
+const REMEMBER_PASSWORD_KEY = "codex-web-remember-password";
 const inflightLoads = new Map();
 const uploadTransfers = new Map();
 let draftTimer = 0;
@@ -61,10 +62,11 @@ async function boot() {
   showApp(); connectEvents(); await refreshControl(); await restoreLastThread();
 }
 
-$("loginForm").addEventListener("submit", async (event) => { event.preventDefault(); $("loginError").textContent = ""; try { await api("/api/login", { method: "POST", body: { password: $("password").value } }); showApp(); connectEvents(); await refreshControl(); } catch (error) { $("loginError").textContent = error.message; } });
+$("loginForm").addEventListener("submit", async (event) => { event.preventDefault(); $("loginError").textContent = ""; try { await api("/api/login", { method: "POST", body: { password: $("password").value } }); saveRememberedPassword(); showApp(); connectEvents(); await refreshControl(); } catch (error) { $("loginError").textContent = error.message; } });
 $("logoutBtn").addEventListener("click", async () => { await api("/api/logout", { method: "POST" }); location.reload(); });
 $("accountMenuBtn").addEventListener("click", (event) => { event.stopPropagation(); toggleAccountMenu(); });
 $("usageMenuBtn").addEventListener("click", openUsage);
+$("switchAccountMenuBtn").addEventListener("click", switchAccount);
 $("themeMenuBtn").addEventListener("click", toggleTheme);
 $("usageCloseBtn").addEventListener("click", closeUsage);
 $("usageModal").addEventListener("click", (event) => { if (event.target === $("usageModal")) closeUsage(); });
@@ -112,8 +114,21 @@ $("messages").addEventListener("scroll", updateFollowTail, { passive: true });
 $("newMessagesBtn").addEventListener("click", () => scrollBottom(true));
 window.addEventListener("beforeunload", saveDraft);
 
-function showLogin() { $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden"); }
+function showLogin() { restoreRememberedPassword(); $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden"); }
 function showApp() { $("loginView").classList.add("hidden"); $("appView").classList.remove("hidden"); }
+function restoreRememberedPassword() {
+  try {
+    const saved = localStorage.getItem(REMEMBER_PASSWORD_KEY) || "";
+    $("password").value = saved;
+    $("rememberPassword").checked = Boolean(saved);
+  } catch { }
+}
+function saveRememberedPassword() {
+  try {
+    if ($("rememberPassword").checked) localStorage.setItem(REMEMBER_PASSWORD_KEY, $("password").value);
+    else localStorage.removeItem(REMEMBER_PASSWORD_KEY);
+  } catch { }
+}
 function syncViewportHeight() {
   const layoutHeight = window.innerHeight;
   const visualHeight = window.visualViewport?.height;
@@ -790,6 +805,7 @@ function handleEvent(event) {
   if (event.type === "queueError") return toast(`队列暂时未发送，将自动重试：${event.data.error}`);
   if (event.type === "serverRequest") return receiveServerRequest(event.data);
   if (event.type === "serverRequestResolved") return resolvePendingRequest(event.data?.requestId);
+  if (event.type === "desktopLive") return applyDesktopLiveEvent(event.data);
   if (event.type !== "notification") return;
   const { method, params } = event.data; const eventThreadId = params?.threadId || params?.thread?.id || params?.turn?.threadId || params?.turn?.thread_id; if (eventThreadId && state.current?.id !== eventThreadId) return;
   if (method === "thread/settings/updated") { state.currentSettings = params.threadSettings || null; applyThreadSettings(state.currentSettings); }
@@ -818,6 +834,61 @@ function handleEvent(event) {
   if (method === "turn/completed") { flushStreamUpdates(); for (const item of params.turn?.items || []) upsertItem(item); cacheCompletedTurn(params.turn); state.activeTurnId = null; state.threadStatus = { type: "idle" }; setActivity(state.queue.length ? { phase: "queue", label: "正在准备下一条排队消息", since: Date.now() } : null); touchCurrentThread(); updateComposer(); renderQueue(); }
   if (method === "serverRequest/resolved") resolvePendingRequest(params.requestId);
   if (method === "error") toast(params.error?.message || params.message || "Codex 运行出错");
+}
+
+function applyDesktopLiveEvent(data = {}) {
+  if (!data.threadId || state.current?.id !== data.threadId) return;
+  if (data.kind === "snapshot" && data.thread) {
+    applyThreadResult({ thread: data.thread }, data.threadId, { syncing: true, restoreScroll: $("messages").scrollTop });
+    return;
+  }
+  if (data.kind === "turnStarted") {
+    state.activeTurnId = data.turnId || `desktop-${data.threadId}`;
+    state.threadStatus = { type: "active", activeFlags: [] };
+    setActivity({ phase: "thinking", label: "桌面 App 正在思考", since: Date.now() });
+    updateComposer();
+    return;
+  }
+  if (data.kind === "activity") {
+    setActivity({ phase: data.phase || "working", label: data.label || "桌面 App 正在处理", since: state.activity?.since || Date.now() });
+    updateComposer();
+    return;
+  }
+  if (data.kind === "user" && data.text) {
+    const id = String(data.itemId || "");
+    if (!findItemNode(id)) {
+      clearEmptyMessages();
+      const node = messageNode("user", data.text); node.dataset.itemId = id; $("messages").append(node); state.itemNodes.set(id, node);
+      scrollBottom();
+    }
+    return;
+  }
+  if (data.kind === "reasoning") {
+    const { stream } = reasoningItem(data.itemId);
+    appendReasoningDelta(stream, "summary", 0, data.delta || "");
+    queueReasoningRender(data.itemId);
+    setActivity({ phase: "thinking", label: "桌面 App 正在思考", since: state.activity?.since || Date.now() });
+    return;
+  }
+  if (data.kind === "agent") {
+    queueStreamAction("agent", data.itemId, data.delta || "");
+    setActivity({ phase: "responding", label: "桌面 App 正在生成回复", since: state.activity?.phase === "responding" ? state.activity.since : Date.now() });
+    return;
+  }
+  if (data.kind === "turnCompleted") {
+    flushStreamUpdates();
+    state.activeTurnId = null;
+    state.threadStatus = { type: "idle" };
+    setActivity(null);
+    updateComposer();
+    // The append stream is intentionally minimal. Refresh once at completion
+    // so the final desktop snapshot also includes cards and any missed record.
+    setTimeout(() => {
+      if (state.control?.mode !== "web" && state.current?.id === data.threadId) api(`/api/threads/${encodeURIComponent(data.threadId)}/snapshot`).then((snapshot) => {
+        if (state.current?.id === data.threadId && snapshot?.thread) applyThreadResult(snapshot, data.threadId, { syncing: true, restoreScroll: $("messages").scrollTop });
+      }).catch(() => {});
+    }, 350);
+  }
 }
 
 function findItemNode(id) { if (!id) return null; const key = String(id); const cached = state.itemNodes.get(key); if (cached?.isConnected) return cached; const node = $("messages").querySelector(`[data-item-id="${CSS.escape(key)}"]`); if (node) state.itemNodes.set(key, node); else state.itemNodes.delete(key); return node; }
@@ -1011,7 +1082,6 @@ function applyThreadStatus(status) {
 
 async function openUsage() {
   closeAccountMenu();
-  if (state.control?.mode !== "web") return toast("接管 Codex 后才能读取实时使用情况");
   $("usageModal").classList.remove("hidden");
   document.body.classList.add("modal-open");
   await loadUsage();
@@ -1055,7 +1125,7 @@ function renderUsage(payload = {}) {
   $("usageRemaining").textContent = `剩余 ${Math.round(remaining)}%`;
   $("resetCreditCount").textContent = `可用 ${count} 次`;
   $("usageCreditDetail").textContent = firstCredit?.description || (count ? "点击使用一次额度重置" : "当前没有可用的重置次数");
-  $("resetLimitBtn").disabled = count < 1;
+  $("resetLimitBtn").disabled = count < 1 || payload.live === false;
   $("resetLimitBtn").dataset.creditId = firstCredit?.id || "";
   const buckets = payload.usage?.dailyUsageBuckets || [];
   const today = new Date().toISOString().slice(0, 10);
@@ -1063,7 +1133,9 @@ function renderUsage(payload = {}) {
   $("usageTodayTokens").textContent = formatCount(todayTokens);
   $("usageLifetimeTokens").textContent = formatCount(payload.usage?.summary?.lifetimeTokens);
   $("usagePlan").textContent = formatPlan(snapshot.planType);
-  $("usageMessage").textContent = snapshot.rateLimitReachedType ? "当前使用限额已达到上限。" : "";
+  $("usageMessage").textContent = payload.live === false
+    ? `只读快照，更新于 ${formatUsageTimestamp(payload.cachedAt)}；接管后可刷新或使用额度重置。`
+    : (snapshot.rateLimitReachedType ? "当前使用限额已达到上限。" : "");
 }
 
 function renderAccountTokenTimeline(payload = {}) {
@@ -1092,7 +1164,29 @@ function renderAccountTokenTimeline(payload = {}) {
   $("usageOutputTokens").textContent = formatCount(month.output);
   $("usageCacheTokens").textContent = formatCount(month.cached);
   $("usageCacheRate").textContent = month.input ? `${Math.round(month.cached / month.input * 100)}%` : "--";
-  $("usageTimelineSource").textContent = "账号总量来自官方；输入、输出和缓存为本机网关本月观察值";
+  $("usageTimelineSource").textContent = payload.live === false ? "账号额度为上次官方快照；输入、输出和缓存为本机网关本月观察值" : "账号总量来自官方；输入、输出和缓存为本机网关本月观察值";
+}
+
+async function switchAccount() {
+  closeAccountMenu();
+  if (state.control?.mode !== "web") return toast("请先接管 Codex，再切换桌面和 Web 的同一账号");
+  let profiles;
+  try { ({ profiles } = await api("/api/accounts")); } catch (error) { return toast(`无法读取账号备份：${error.message}`); }
+  if (!profiles?.length) return toast("未找到账号备份，请先用账号备份工具保存账号");
+  const options = profiles.map((profile, index) => `${index + 1}. ${profile.label || "未命名账号"}${profile.hint ? `（${profile.hint}）` : ""}`).join("\n");
+  const selected = Number(prompt(`选择要切换的账号：\n${options}`, "1"));
+  if (!Number.isInteger(selected) || selected < 1 || selected > profiles.length) return;
+  const profile = profiles[selected - 1];
+  if (!confirm(`切换到“${profile.label || "未命名账号"}”？\n\n会安全替换桌面和 Web 共用的登录账号，并重启 Web Codex。进行中的任务、审批或排队消息必须先处理完。`)) return;
+  $("accountSwitchOverlay").classList.remove("hidden");
+  try {
+    const result = await api("/api/accounts/activate", { method: "POST", body: { profileId: profile.id } });
+    toast(`已切换到 ${result.profile?.label || profile.label || "所选账号"}，正在重新连接…`);
+    setTimeout(() => location.reload(), Math.max(1500, Number(result.reconnectAfterMs) || 4500));
+  } catch (error) {
+    $("accountSwitchOverlay").classList.add("hidden");
+    toast(`账号切换失败：${error.message}`);
+  }
 }
 
 async function resetRateLimit() {
@@ -1115,6 +1209,7 @@ async function resetRateLimit() {
 }
 
 function formatResetTime(value) { const date = new Date(Number(value) * 1000); if (Number.isNaN(date.getTime())) return ""; return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date); }
+function formatUsageTimestamp(value) { const date = new Date(Number(value)); if (Number.isNaN(date.getTime())) return "未知时间"; return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date); }
 function formatCount(value) { const count = Number(value); if (!Number.isFinite(count)) return "--"; return new Intl.NumberFormat("zh-CN", { notation: count >= 10_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(count); }
 function formatPlan(value) { const names = { free: "Free", go: "Go", plus: "Plus", pro: "Pro", prolite: "Pro Lite", team: "Team", business: "Business", enterprise: "Enterprise", edu: "Edu" }; return names[value] || value || "--"; }
 

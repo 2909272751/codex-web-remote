@@ -10,7 +10,12 @@ const port = 18992;
 const base = `http://127.0.0.1:${port}`;
 const password = "integration-test-only";
 const desktopStateFile = path.join(temp, "desktop-state.json");
-await fsp.writeFile(desktopStateFile, JSON.stringify({ running: false, processes: [] }));
+const desktopSessionsRoot = path.join(temp, "desktop-sessions");
+const desktopThreadId = "01234567-89ab-4cde-8fab-0123456789ab";
+const desktopSession = path.join(desktopSessionsRoot, `rollout-test-${desktopThreadId}.jsonl`);
+await fsp.writeFile(desktopStateFile, JSON.stringify({ running: true, processes: [{ pid: 4242, name: "ChatGPT.exe", main: true }] }));
+await fsp.mkdir(desktopSessionsRoot, { recursive: true });
+await fsp.writeFile(desktopSession, "");
 let cookie = "";
 let secondaryCookie = "";
 let lastSetCookie = "";
@@ -28,6 +33,7 @@ const serverEnv = {
   CODEX_WEB_DATA_DIR: path.join(temp, "data"),
   CODEX_WEB_UPLOAD_DIR: path.join(temp, "uploads"),
   CODEX_WEB_TEST_DESKTOP_STATE_FILE: desktopStateFile,
+  CODEX_WEB_SESSION_ROOT: desktopSessionsRoot,
 };
 
 const request = async (url, options = {}) => {
@@ -69,6 +75,43 @@ try {
   child = await startServer();
   await request("/api/login", { method: "POST", body: { password } });
   if (!/Max-Age=86400/i.test(lastSetCookie)) throw new Error(`Unexpected session lifetime: ${lastSetCookie}`);
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  let desktopLiveOutput = "";
+  let desktopLiveCompleted = false;
+  const desktopEvents = [];
+  const desktopSocket = new WebSocket(`${base.replace("http", "ws")}/events`, { headers: { Cookie: cookie } });
+  await new Promise((resolve, reject) => { desktopSocket.once("open", resolve); desktopSocket.once("error", reject); });
+  desktopSocket.on("message", (raw) => {
+    try {
+      const event = JSON.parse(String(raw));
+      desktopEvents.push(event.type);
+      if (event.type === "desktopLive" && event.data?.threadId === desktopThreadId) {
+        if (event.data.kind === "agent") desktopLiveOutput += event.data.delta || "";
+        if (event.data.kind === "snapshot") desktopLiveOutput += JSON.stringify(event.data.thread || {});
+        if (event.data.kind === "turnCompleted") desktopLiveCompleted = true;
+      }
+    } catch { }
+  });
+  // First filesystem notification can establish the tail cursor when a
+  // gateway was started midway through a desktop task.  Send an empty append
+  // first, then verify the following desktop output is forwarded live.
+  await fsp.appendFile(desktopSession, "\n");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const desktopRecords = [
+    { type: "event_msg", payload: { type: "task_started", turn_id: "desktop-turn" } },
+    { type: "event_msg", payload: { type: "agent_reasoning", text: "desktop reasoning" } },
+    { type: "response_item", payload: { type: "function_call", id: "desktop-call-item", name: "shell_command", call_id: "desktop-call", arguments: JSON.stringify({ command: "echo DESKTOP_TOOL_OUTPUT_OK", workdir: temp }) } },
+    { type: "response_item", payload: { type: "function_call_output", call_id: "desktop-call", output: "DESKTOP_TOOL_OUTPUT_OK" } },
+    { type: "event_msg", payload: { type: "agent_message", message: "DESKTOP_LIVE_OUTPUT_OK" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "desktop-turn" } },
+  ].map((record) => `${JSON.stringify(record)}\n`).join("");
+  await fsp.appendFile(desktopSession, desktopRecords);
+  try { await waitFor(() => desktopLiveOutput.includes("DESKTOP_LIVE_OUTPUT_OK"), 12_000); }
+  catch { throw new Error(`Desktop live session output was not forwarded: ${JSON.stringify({ desktopLiveOutput, desktopLiveCompleted, desktopEvents })}`); }
+  try { await waitFor(() => desktopLiveOutput.includes("DESKTOP_TOOL_OUTPUT_OK"), 12_000); }
+  catch { throw new Error(`Desktop live tool snapshot was not forwarded: ${JSON.stringify({ desktopLiveOutput, desktopLiveCompleted, desktopEvents })}`); }
+  desktopSocket.close();
+  await fsp.writeFile(desktopStateFile, JSON.stringify({ running: false, processes: [] }));
   const persistedSessions = await fsp.readFile(path.join(temp, "data", "sessions.json"), "utf8");
   if (persistedSessions.includes(cookie.split("=")[1])) throw new Error("Raw session token was persisted");
   await request("/api/control/takeover", { method: "POST", body: {} });
@@ -217,6 +260,10 @@ try {
   child = await startServer();
   const restoredSession = await request("/api/session");
   if (!restoredSession.authenticated) throw new Error("24-hour session did not survive a server restart");
+  if (accountUsageVerified) {
+    const cachedUsage = await request("/api/account/usage");
+    if (cachedUsage.live !== false || !cachedUsage.rateLimits) throw new Error("Read-only mode did not return the last official account usage snapshot");
+  }
   await request("/api/control/takeover", { method: "POST", body: {} });
   await fsp.writeFile(desktopStateFile, JSON.stringify({ running: true, processes: [{ pid: 4242, name: "ChatGPT.exe", main: true }] }));
   await waitFor(async () => (await request("/api/session")).mode === "desktop", 15_000);
