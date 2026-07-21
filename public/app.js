@@ -17,41 +17,73 @@ import {
 } from "./timeline.js";
 
 const $ = (id) => document.getElementById(id);
-const state = { threads: [], projects: [], selectedProjectId: null, projectsLoaded: false, directory: null, createAfterProject: false, models: [], current: null, currentSettings: null, threadStatus: null, tokenUsage: null, pendingThreadId: null, socket: null, socketConnected: false, reconnectTimer: null, activeTurnId: null, activity: null, control: null, attachments: [], queue: [], reasoningStreams: new Map(), usage: null, resetAttemptId: null, usageRefreshTimer: null, pendingRequests: [], lastEventSeq: 0, syncing: false, eventBacklog: [], reconnectCount: 0, update: null, updateLoaded: false };
+const HISTORY_BATCH_SIZE = 80;
+const HISTORY_DOM_LIMIT = 240;
+const THREAD_VIEW_LIMIT = 8;
+const inflightLoads = new Map();
+const uploadTransfers = new Map();
+let draftTimer = 0;
+const state = { threads: [], projects: [], selectedProjectId: null, projectsLoaded: false, directory: null, createAfterProject: false, models: [], current: null, currentSettings: null, threadStatus: null, tokenUsage: null, pendingThreadId: null, threadViews: new Map(), threadOpenController: null, threadSyncing: false, socket: null, socketConnected: false, socketEverConnected: false, reconnectTimer: null, reconnectStableTimer: null, activeTurnId: null, activity: null, control: null, attachments: [], queue: [], reasoningStreams: new Map(), itemNodes: new Map(), historyItems: [], historyVisibleStart: 0, historyVisibleEnd: 0, streamActions: [], reasoningDirty: new Set(), streamFrame: 0, scrollFrame: 0, followTail: true, viewportFrame: 0, controlRefreshTimer: 0, controlRefreshResources: false, usage: null, resetAttemptId: null, usageRefreshTimer: null, pendingRequests: [], lastEventSeq: 0, syncing: false, eventBacklog: [], reconnectCount: 0, update: null, updateLoaded: false };
 syncViewportHeight();
-window.addEventListener("resize", syncViewportHeight, { passive: true });
-window.addEventListener("orientationchange", syncViewportHeight, { passive: true });
-window.visualViewport?.addEventListener("resize", syncViewportHeight, { passive: true });
-window.visualViewport?.addEventListener("scroll", syncViewportHeight, { passive: true });
+window.addEventListener("resize", scheduleViewportSync, { passive: true });
+window.addEventListener("orientationchange", scheduleViewportSync, { passive: true });
+window.visualViewport?.addEventListener("resize", scheduleViewportSync, { passive: true });
+window.visualViewport?.addEventListener("scroll", scheduleViewportSync, { passive: true });
 boot();
-setInterval(renderActivity, 1000);
+setInterval(() => { if (!document.hidden && state.activity) renderActivity(); }, 1000);
+
+function readTheme() {
+  try { return localStorage.getItem("codex-web-theme") || "system"; } catch { return "system"; }
+}
+function applyTheme(theme = "system") {
+  const value = ["light", "dark", "system"].includes(theme) ? theme : "system";
+  const dark = value === "dark" || (value === "system" && window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const button = $("themeMenuBtn");
+  if (!button) return;
+  const icon = button.querySelector("span");
+  if (icon) icon.textContent = value === "dark" ? "☾" : value === "light" ? "☀" : "◐";
+  const text = icon?.nextSibling;
+  if (text) text.textContent = ` 外观：${value === "dark" ? "深色模式" : value === "light" ? "浅色模式" : "跟随系统"}`;
+}
+function toggleTheme() {
+  const current = readTheme();
+  const next = current === "system" ? "dark" : current === "dark" ? "light" : "system";
+  try { localStorage.setItem("codex-web-theme", next); } catch {}
+  applyTheme(next);
+}
+applyTheme(readTheme());
+window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener("change", () => { if (readTheme() === "system") applyTheme("system"); });
 
 async function boot() {
   const session = await api("/api/session", { allow401: true });
   if (!session?.authenticated) return showLogin();
-  showApp(); connectEvents(); await refreshControl();
+  showApp(); connectEvents(); await refreshControl(); await restoreLastThread();
 }
 
 $("loginForm").addEventListener("submit", async (event) => { event.preventDefault(); $("loginError").textContent = ""; try { await api("/api/login", { method: "POST", body: { password: $("password").value } }); showApp(); connectEvents(); await refreshControl(); } catch (error) { $("loginError").textContent = error.message; } });
 $("logoutBtn").addEventListener("click", async () => { await api("/api/logout", { method: "POST" }); location.reload(); });
 $("accountMenuBtn").addEventListener("click", (event) => { event.stopPropagation(); toggleAccountMenu(); });
 $("usageMenuBtn").addEventListener("click", openUsage);
+$("themeMenuBtn").addEventListener("click", toggleTheme);
 $("usageCloseBtn").addEventListener("click", closeUsage);
 $("usageModal").addEventListener("click", (event) => { if (event.target === $("usageModal")) closeUsage(); });
 $("resetLimitBtn").addEventListener("click", resetRateLimit);
 $("updateNowBtn").addEventListener("click", applyHostUpdate);
 document.addEventListener("click", (event) => { if (!event.target.closest(".sidebar-footer")) closeAccountMenu(); });
 $("refreshBtn").addEventListener("click", () => state.control?.mode === "web" ? loadThreads() : loadThreadPreviews());
-$("search").addEventListener("input", renderThreads);
+$("search").addEventListener("input", scheduleThreadRender);
 $("menuBtn").addEventListener("click", () => $("sidebar").classList.toggle("open"));
 $("menuBtn").addEventListener("click", () => $("sidebarBackdrop").classList.toggle("open", $("sidebar").classList.contains("open")));
 $("sidebarBackdrop").addEventListener("click", closeSidebar);
 $("sidebarCloseBtn").addEventListener("click", closeSidebar);
 $("mobileToolsBtn").addEventListener("click", toggleComposerTools);
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") { closeProjectModal(); closeSidebar(); } });
-document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.socketConnected) connectEvents(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { renderActivity(); if (!state.socketConnected) connectEvents(); } });
+window.addEventListener("online", () => { clearTimeout(state.reconnectTimer); connectEvents(); });
+window.addEventListener("offline", () => { state.socketConnected = false; renderActivity(); });
 $("composer").addEventListener("submit", sendMessage);
-$("messageInput").addEventListener("input", autoSize);
+$("messageInput").addEventListener("input", handleComposerInput);
 $("messageInput").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); $("composer").requestSubmit(); } });
 $("messageInput").addEventListener("paste", handlePaste);
 $("composer").addEventListener("dragover", (event) => { event.preventDefault(); });
@@ -76,6 +108,9 @@ $("releaseBtn").addEventListener("click", releaseControl);
 $("interruptBtn").addEventListener("click", interruptTurn);
 $("sendBtn").addEventListener("click", (event) => { if (state.activeTurnId) { event.preventDefault(); interruptTurn(); } });
 $("clearQueueBtn").addEventListener("click", clearQueue);
+$("messages").addEventListener("scroll", updateFollowTail, { passive: true });
+$("newMessagesBtn").addEventListener("click", () => scrollBottom(true));
+window.addEventListener("beforeunload", saveDraft);
 
 function showLogin() { $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden"); }
 function showApp() { $("loginView").classList.add("hidden"); $("appView").classList.remove("hidden"); }
@@ -88,21 +123,34 @@ function syncViewportHeight() {
   const appHeight = Math.min(layoutHeight, Number.isFinite(visualHeight) ? visualHeight : layoutHeight);
   document.documentElement.style.setProperty("--app-height", `${Math.round(appHeight)}px`);
 }
+function scheduleViewportSync() { if (state.viewportFrame) return; state.viewportFrame = requestAnimationFrame(() => { state.viewportFrame = 0; syncViewportHeight(); }); }
 function closeSidebar() { $("sidebar").classList.remove("open"); $("sidebarBackdrop").classList.remove("open"); }
 function toggleComposerTools() { const open = $("composerSettings").classList.toggle("open"); document.querySelector(".chat-shell")?.classList.toggle("tools-open", open); }
 function toggleAccountMenu() { const open = $("accountMenu").classList.toggle("hidden") === false; $("accountMenuBtn").setAttribute("aria-expanded", String(open)); }
 function closeAccountMenu() { $("accountMenu").classList.add("hidden"); $("accountMenuBtn").setAttribute("aria-expanded", "false"); }
 
-async function refreshControl() {
+async function refreshControl({ reloadResources = true } = {}) {
   state.control = await api("/api/control/status");
   state.pendingRequests = Array.isArray(state.control.pendingRequests) ? state.control.pendingRequests : [];
   renderControl();
-  await loadProjects().catch((error) => toast(`项目列表：${error.message}`));
   if (state.current?.id && state.control.activities?.[state.current.id]) setActivity(state.control.activities[state.current.id]);
-  if (state.control.mode === "web" && state.control.controller) await loadThreads();
-  else await loadThreadPreviews();
-  if (state.control.mode === "web" && !state.models.length) await loadModels().catch((error) => toast(`模型列表：${error.message}`));
-  if (!state.updateLoaded) await loadUpdateStatus();
+  if (!reloadResources) return;
+  const work = [];
+  if (!state.projectsLoaded) work.push(loadProjects().catch((error) => toast(`项目列表：${error.message}`)));
+  work.push(state.control.mode === "web" && state.control.controller ? loadThreads() : loadThreadPreviews());
+  if (state.control.mode === "web" && !state.models.length) work.push(loadModels().catch((error) => toast(`模型列表：${error.message}`)));
+  if (!state.updateLoaded) work.push(loadUpdateStatus());
+  await Promise.all(work);
+}
+
+function scheduleControlRefresh(reloadResources = false) {
+  state.controlRefreshResources ||= reloadResources;
+  clearTimeout(state.controlRefreshTimer);
+  state.controlRefreshTimer = setTimeout(() => {
+    const shouldReload = state.controlRefreshResources;
+    state.controlRefreshResources = false;
+    refreshControl({ reloadResources: shouldReload }).catch(() => {});
+  }, 80);
 }
 
 async function loadUpdateStatus() {
@@ -141,6 +189,8 @@ async function applyHostUpdate() {
 
 function renderControl() {
   const c = state.control || {};
+  const readonly = c.mode !== "web";
+  document.documentElement.classList.toggle("readonly-mode", readonly);
   $("statusDot").classList.toggle("ready", c.mode === "web" && c.codexReady);
   $("takeoverBtn").classList.toggle("hidden", c.mode === "web");
   $("releaseBtn").classList.toggle("hidden", c.mode !== "web" || !c.controller);
@@ -151,6 +201,11 @@ function renderControl() {
   $("permissionShortcut").textContent = c.fullAccess ? "♧ 完全访问" : "♧ 标准权限";
   $("permissionShortcut").classList.toggle("enabled", Boolean(c.fullAccess));
   $("takeoverBtn").disabled = c.transition || c.controllerBusy;
+  $("takeoverBtn").textContent = c.transition ? "正在切换…" : c.takeoverState?.phase === "failed" ? "重试接管" : c.takeoverState?.phase === "busy" ? "桌面任务运行中" : "接管 Codex";
+  const activeCount = Object.keys(c.activeTurns || {}).length;
+  const queuedCount = Number(c.queuedCount || 0);
+  const clientCount = Number(c.webClientCount || 0);
+  $("controlMeta").textContent = c.mode === "web" ? `共享控制 · ${Math.max(1, clientCount)} 个 Web 端在线${activeCount ? ` · ${activeCount} 个任务运行中` : ""}${queuedCount ? ` · ${queuedCount} 条排队` : ""}` : (c.desktopRunning ? `${c.desktopProcesses?.length || 0} 个桌面进程 · 仅可只读浏览` : "可安全接管");
   if (state.update?.updateAvailable) $("updateNowBtn").disabled = !state.update.updaterAvailable || c.mode !== "web";
   const labels = { desktop: "桌面 App 正在使用；接管后会正常关闭桌面 App", available: "桌面 App 未运行，可以接管", web: "Web 共享控制已开启，可在多个设备同时使用" };
   $("controlText").textContent = c.transition ? (c.takeoverState?.message || "正在切换…") : (c.takeoverState?.phase === "failed" ? `接管失败：${c.takeoverState.message}` : (labels[c.mode] || c.mode));
@@ -162,7 +217,7 @@ function renderControl() {
   if (c.mode !== "web" && !state.pendingThreadId && !state.current) $("messages").replaceChildren(emptyNode("左侧可只读查看任务；接管后可以继续对话和操作"));
   if (state.current?.id && c.mode === "web") {
     const settings = c.threadSettings?.[state.current.id];
-    if (settings) { state.currentSettings = settings; applyThreadSettings(settings); }
+    if (settings && settings !== state.currentSettings) { state.currentSettings = settings; applyThreadSettings(settings); }
     if (c.threadTokenUsage?.[state.current.id]) state.tokenUsage = c.threadTokenUsage[state.current.id];
     const restored = c.activities?.[state.current.id];
     const running = c.activeTurns?.[state.current.id];
@@ -171,7 +226,7 @@ function renderControl() {
     else if (running && !state.activity) setActivity({ phase: "working", label: "正在处理", since: Date.now() });
     else if (!running) setActivity(null);
     if (c.threadStatuses?.[state.current.id]) applyThreadStatus(c.threadStatuses[state.current.id]);
-    renderRuntimeCards(c.turnPlans?.[state.current.id], c.turnDiffs?.[state.current.id]);
+    renderRuntimeCards(c.turnPlans?.[state.current.id], c.turnDiffs?.[state.current.id], { onlyMissing: true });
   }
   if (c.mode !== "web") { state.activeTurnId = null; setActivity(null); }
   renderInteraction();
@@ -212,8 +267,8 @@ async function releaseControl() {
   }
 }
 
-async function loadThreads() { const result = await api("/api/threads"); state.threads = result.data || []; renderThreads(); }
-async function loadThreadPreviews() { const result = await api("/api/thread-previews"); state.threads = result.data || []; renderThreads(); }
+async function loadThreads() { return singleFlight("threads", async () => { const result = await api("/api/threads"); state.threads = result.data || []; renderThreads(); }); }
+async function loadThreadPreviews() { return singleFlight("thread-previews", async () => { const result = await api("/api/thread-previews"); state.threads = result.data || []; renderThreads(); }); }
 async function loadProjects(preferredId = null) {
   const result = await api("/api/projects");
   state.projects = Array.isArray(result.data) ? result.data : [];
@@ -228,7 +283,7 @@ async function loadProjects(preferredId = null) {
   writeProjectPreference(state.selectedProjectId);
   renderProjects(); renderThreads();
 }
-async function loadModels() { const result = await api("/api/models"); state.models = result.data || []; renderModels(); }
+async function loadModels() { return singleFlight("models", async () => { const result = await api("/api/models"); state.models = result.data || []; renderModels(); }); }
 function renderModels() { const select = $("modelSelect"); const selected = select.value; const options = [new Option("默认模型", "")]; for (const model of state.models) options.push(new Option(model.displayName || model.name || model.model || model.id, model.model || model.id)); select.replaceChildren(...options); if ([...select.options].some((item) => item.value === selected)) select.value = selected; renderEfforts(); }
 function renderEfforts() { const model = state.models.find((item) => (item.model || item.id) === $("modelSelect").value); const values = model?.supportedReasoningEfforts || []; const selected = $("effortSelect").value; const labels = { none: "无思考", minimal: "极轻", low: "轻度", medium: "中等", high: "较深", xhigh: "深度", max: "最深", ultra: "Ultra" }; $("effortSelect").replaceChildren(new Option("默认强度", ""), ...values.map((item) => { const value = typeof item === "string" ? item : (item.reasoningEffort || item.effort || item.value); return new Option(labels[value] || value, value); })); if ([...$("effortSelect").options].some((item) => item.value === selected)) $("effortSelect").value = selected; }
 
@@ -280,6 +335,8 @@ function renderThreads() {
   if (!nodes.length) { const empty = document.createElement("div"); empty.className = "thread-list-empty"; empty.textContent = project ? "这个项目还没有任务" : "暂无任务"; nodes.push(empty); }
   $("threadList").replaceChildren(...nodes);
 }
+let threadRenderFrame = 0;
+function scheduleThreadRender() { if (threadRenderFrame) return; threadRenderFrame = requestAnimationFrame(() => { threadRenderFrame = 0; renderThreads(); }); }
 
 function openProjectModal(createAfter = false) {
   state.createAfterProject = createAfter;
@@ -339,75 +396,220 @@ function projectContainsPath(projectPath, candidatePath) { const project = norma
 function folderName(value) { const parts = String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/); return parts.at(-1) || value; }
 function readProjectPreference() { try { const value = localStorage.getItem("codex-web-project-id"); return value === "__all__" ? "" : value; } catch { return null; } }
 function writeProjectPreference(value) { try { localStorage.setItem("codex-web-project-id", value || "__all__"); } catch { } }
+function readLastThreadPreference() { try { return localStorage.getItem("codex-web-last-thread") || ""; } catch { return ""; } }
+function writeLastThreadPreference(id) { try { if (id) localStorage.setItem("codex-web-last-thread", id); } catch { } }
+async function restoreLastThread() {
+  const id = readLastThreadPreference();
+  if (!id || state.current?.id === id) return;
+  const preview = state.threads.find((thread) => thread.id === id);
+  if (!preview) return;
+  if (state.control?.mode === "web" && state.control?.controller) await openThread(id);
+  else await previewThread(preview);
+}
 
 async function previewThread(thread) {
+  saveDraft();
   state.pendingThreadId = thread.id;
   $("chatTitle").textContent = thread.preview || "Codex 任务"; $("chatMeta").textContent = "正在读取本机记录…";
   $("messages").replaceChildren(emptyNode("正在加载对话历史…"));
   renderThreads(); closeSidebar(); updateComposer();
   try {
-    const result = await api(`/api/thread-previews/${encodeURIComponent(thread.id)}`);
+    let result;
+    try {
+      result = await api(`/api/threads/${encodeURIComponent(thread.id)}/snapshot`);
+    } catch (error) {
+      if (!/HTTP 404/.test(error.message)) throw error;
+      result = await api(`/api/thread-previews/${encodeURIComponent(thread.id)}`);
+    }
     if (state.pendingThreadId !== thread.id) return;
     state.current = result.thread;
     $("chatMeta").textContent = `${result.thread.cwd || thread.id} · 只读`;
-    renderHistory(result.thread.turns || []); renderThreads(); updateComposer();
+    renderHistory(result.thread.turns || []); restoreDraft(result.thread.id); renderThreads(); updateComposer();
   } catch (error) { $("messages").replaceChildren(emptyNode(error.message)); toast(error.message); }
 }
 
 async function openThread(id) {
-  const result = await api(`/api/threads/${encodeURIComponent(id)}`);
-  const actualId = result.thread?.id || id;
-  if (result.replacedThreadId) {
-    state.threads = state.threads.filter((thread) => thread.id !== result.replacedThreadId && thread.id !== actualId);
-    state.threads.unshift(result.thread);
-    toast("空任务已恢复，可以继续输入");
-  }
-  applyThreadResult(result, actualId);
-  renderThreads(); closeSidebar(); await loadQueue(); updateComposer();
+  if (state.current?.id === id && !state.threadSyncing) { closeSidebar(); return; }
+  saveDraft();
+  saveCurrentThreadView();
+  state.threadOpenController?.abort();
+  const controller = new AbortController(); state.threadOpenController = controller;
+  const descriptor = state.threads.find((thread) => thread.id === id) || { id, preview: "Codex 任务", cwd: "" };
+  state.pendingThreadId = id; state.threadSyncing = true; state.current = { ...descriptor, turns: [] }; state.queue = [];
+  $("chatTitle").textContent = descriptor.preview || "Codex 任务"; $("chatMeta").textContent = `${descriptor.cwd || id} · 正在同步 Codex`;
+  $("messages").replaceChildren(emptyNode("正在加载本地对话快照…"));
+  renderThreads(); renderQueue(); closeSidebar(); updateComposer();
+
+  const cachedView = readThreadView(id);
+  if (cachedView) applyThreadResult(cachedView.result, id, { syncing: true, restoreScroll: cachedView.scrollTop });
+  const snapshotRequest = cachedView ? Promise.resolve() : loadThreadSnapshot(id, controller);
+  try {
+    await delay(120, controller.signal);
+    const syncController = new AbortController();
+    const stopSync = () => syncController.abort();
+    controller.signal.addEventListener("abort", stopSync, { once: true });
+    const syncTimer = setTimeout(() => syncController.abort(), 10_000);
+    let result;
+    try {
+      result = await api(`/api/threads/${encodeURIComponent(id)}`, { signal: syncController.signal });
+    } finally {
+      clearTimeout(syncTimer);
+      controller.signal.removeEventListener("abort", stopSync);
+    }
+    if (state.threadOpenController !== controller) return;
+    const actualId = result.thread?.id || id;
+    if (result.replacedThreadId) {
+      state.threads = state.threads.filter((thread) => thread.id !== result.replacedThreadId && thread.id !== actualId);
+      state.threads.unshift(result.thread); toast("空任务已恢复，可以继续输入");
+    }
+    const restoreScroll = state.followTail ? null : $("messages").scrollTop;
+    applyThreadResult(result, actualId, { syncing: false, restoreScroll });
+    renderThreads(); loadQueue().catch(() => {}); updateComposer();
+  } catch (error) {
+    if (error.name === "AbortError" || state.threadOpenController !== controller) return;
+    if (state.current?.id === id && state.current?.turns?.length) {
+      state.pendingThreadId = null;
+      state.threadSyncing = true;
+      $("chatMeta").textContent = `${descriptor.cwd || id} · 已显示本地快照，后台同步中`;
+      renderThreads(); updateComposer();
+      return;
+    }
+    state.pendingThreadId = null; state.threadSyncing = true;
+    $("chatMeta").textContent = `${descriptor.cwd || id} · 同步失败，点击任务重试`;
+    renderThreads(); updateComposer(); toast(error.message);
+  } finally { await snapshotRequest.catch(() => {}); }
 }
 
-function applyThreadResult(result, id = result.thread?.id) {
+async function loadThreadSnapshot(id, controller) {
+  const snapshotController = new AbortController();
+  const abortSnapshot = () => snapshotController.abort();
+  controller.signal.addEventListener("abort", abortSnapshot, { once: true });
+  const snapshotTimer = setTimeout(() => snapshotController.abort(), 8_000);
+  try {
+    const result = await api(`/api/threads/${encodeURIComponent(id)}/snapshot`, { signal: snapshotController.signal });
+    if (state.threadOpenController !== controller || !state.threadSyncing) return;
+    applyThreadResult(result, id, { syncing: true, restoreScroll: null });
+  } catch (error) { if (error.name !== "AbortError" && !/HTTP 404|本地快照/.test(error.message)) toast("本地快照暂时不可用，正在尝试实时同步"); }
+  finally { clearTimeout(snapshotTimer); controller.signal.removeEventListener("abort", abortSnapshot); }
+}
+
+function applyThreadResult(result, id = result.thread?.id, { syncing = false, restoreScroll = null } = {}) {
+  const changedThread = state.current?.id !== id;
   state.current = result.thread;
+  writeLastThreadPreference(id);
+  state.threadSyncing = syncing;
+  if (changedThread) { state.queue = []; renderQueue(); }
   state.currentSettings = result.threadSettings || state.control?.threadSettings?.[id] || null;
   state.threadStatus = result.thread?.status || state.control?.threadStatuses?.[id] || null;
   state.tokenUsage = result.tokenUsage || state.control?.threadTokenUsage?.[id] || null;
   state.pendingRequests = mergePendingRequests(state.control?.pendingRequests || [], result.pendingRequests || []);
   state.pendingThreadId = null;
+  if (changedThread) restoreDraft(id);
   applyThreadSettings(state.currentSettings);
   state.activeTurnId = result.thread.status?.type === "active" ? (state.control?.activeTurns?.[id] || null) : null;
   setActivity(state.control?.activities?.[id] || (state.activeTurnId ? { phase: "working", label: "正在处理", since: Date.now() } : null));
-  $("chatTitle").textContent = result.thread.preview || "Codex 任务"; $("chatMeta").textContent = result.thread.cwd || id;
-  renderHistory(result.thread.turns || []);
+  $("chatTitle").textContent = result.thread.preview || "Codex 任务"; $("chatMeta").textContent = `${result.thread.cwd || id}${syncing ? " · 已显示缓存，正在同步" : ""}`;
+  renderHistory(result.thread.turns || [], { restoreScroll });
   renderRuntimeCards(result.turnPlan || state.control?.turnPlans?.[id], result.turnDiff || state.control?.turnDiffs?.[id]);
-  renderInteraction();
+  renderInteraction(); rememberThreadView(id, result, restoreScroll ?? $("messages").scrollTop); updateComposer();
 }
 
-function renderHistory(turns) { state.reasoningStreams.clear(); const nodes = []; for (const turn of turns) for (const item of turn.items || []) { const node = itemNode(item); if (node) { if (item.id) node.dataset.itemId = item.id; nodes.push(node); } } $("messages").replaceChildren(...(nodes.length ? nodes : [emptyNode("这个任务暂时没有可显示的消息")])); scrollBottom(); }
-function itemNode(item) { if (item.type === "userMessage") return messageNode("user", textFromContent(item.content)); if (item.type === "agentMessage") return messageNode("assistant", item.text || ""); if (item.type === "reasoning") { const stream = createReasoningState(item); if (item.id) state.reasoningStreams.set(item.id, stream); return reasoningNode(item, stream); } return timelineItemNode(item); }
+function renderHistory(turns, { restoreScroll = null } = {}) {
+  resetMessageCaches();
+  state.historyItems = turns.flatMap((turn) => turn.items || []);
+  state.historyVisibleStart = Math.max(0, state.historyItems.length - HISTORY_BATCH_SIZE);
+  state.historyVisibleEnd = state.historyItems.length;
+  const nodes = state.historyItems.slice(state.historyVisibleStart, state.historyVisibleEnd).map((item, offset) => historyItemNode(item, state.historyVisibleStart + offset)).filter(Boolean);
+  const more = historyMoreNode();
+  $("messages").replaceChildren(...(more ? [more, ...nodes] : nodes.length ? nodes : [emptyNode("这个任务暂时没有可显示的消息")]));
+  if (Number.isFinite(restoreScroll)) requestAnimationFrame(() => { $("messages").scrollTop = restoreScroll; updateFollowTail(); });
+  else scrollBottom(true);
+}
+function historyItemNode(item, index = -1) { const node = itemNode(item, { lazy: true }); if (!node) return null; node.classList.add("history-item"); if (index >= 0) node.dataset.historyIndex = String(index); if (item.id) { node.dataset.itemId = item.id; state.itemNodes.set(String(item.id), node); } return node; }
+function historyMoreNode() {
+  if (!state.historyVisibleStart) return null;
+  const button = document.createElement("button"); button.type = "button"; button.className = "history-more"; button.textContent = `加载更早的 ${state.historyVisibleStart} 条内容`;
+  button.addEventListener("click", renderEarlierHistory); return button;
+}
+function historyLaterNode() {
+  if (state.historyVisibleEnd >= state.historyItems.length) return null;
+  const button = document.createElement("button"); button.type = "button"; button.className = "history-more history-later"; button.textContent = `返回较新的 ${state.historyItems.length - state.historyVisibleEnd} 条内容`;
+  button.addEventListener("click", renderLaterHistory); return button;
+}
+function refreshHistoryNavigation() {
+  const messages = $("messages");
+  messages.querySelector(":scope > .history-more:not(.history-later)")?.remove();
+  messages.querySelector(":scope > .history-later")?.remove();
+  const first = messages.querySelector(":scope > .history-item");
+  const more = historyMoreNode(); if (more) messages.insertBefore(more, first || messages.firstChild);
+  const later = historyLaterNode(); if (later) messages.append(later);
+}
+function trimHistoryWindow(edge) {
+  const count = state.historyVisibleEnd - state.historyVisibleStart;
+  if (count <= HISTORY_DOM_LIMIT) return;
+  const removeCount = count - HISTORY_DOM_LIMIT;
+  if (edge === "newer") {
+    const cutoff = state.historyVisibleEnd - removeCount;
+    for (const node of $("messages").querySelectorAll(":scope > .history-item")) if (Number(node.dataset.historyIndex) >= cutoff) node.remove();
+    state.historyVisibleEnd = cutoff;
+  } else {
+    const cutoff = state.historyVisibleStart + removeCount;
+    for (const node of $("messages").querySelectorAll(":scope > .history-item")) if (Number(node.dataset.historyIndex) < cutoff) node.remove();
+    state.historyVisibleStart = cutoff;
+  }
+}
+function renderEarlierHistory() {
+  const messages = $("messages"); const previousHeight = messages.scrollHeight; const previousTop = messages.scrollTop;
+  const nextStart = Math.max(0, state.historyVisibleStart - HISTORY_BATCH_SIZE);
+  const nodes = state.historyItems.slice(nextStart, state.historyVisibleStart).map((item, offset) => historyItemNode(item, nextStart + offset)).filter(Boolean);
+  state.historyVisibleStart = nextStart;
+  messages.querySelector(":scope > .history-more")?.remove();
+  const anchor = messages.firstChild;
+  const fragment = document.createDocumentFragment(); const more = historyMoreNode(); if (more) fragment.append(more); for (const node of nodes) fragment.append(node);
+  messages.insertBefore(fragment, anchor);
+  trimHistoryWindow("newer");
+  refreshHistoryNavigation();
+  requestAnimationFrame(() => { messages.scrollTop = previousTop + messages.scrollHeight - previousHeight; updateFollowTail(); });
+}
+function renderLaterHistory() {
+  const messages = $("messages"); const previousHeight = messages.scrollHeight; const previousTop = messages.scrollTop;
+  const previousEnd = state.historyVisibleEnd;
+  const nextEnd = Math.min(state.historyItems.length, previousEnd + HISTORY_BATCH_SIZE);
+  const nodes = state.historyItems.slice(previousEnd, nextEnd).map((item, offset) => historyItemNode(item, previousEnd + offset)).filter(Boolean);
+  state.historyVisibleEnd = nextEnd;
+  messages.querySelector(":scope > .history-later")?.remove();
+  const fragment = document.createDocumentFragment(); for (const node of nodes) fragment.append(node); messages.append(fragment);
+  trimHistoryWindow("older");
+  refreshHistoryNavigation();
+  requestAnimationFrame(() => { messages.scrollTop = Math.max(0, previousTop - (previousHeight - messages.scrollHeight)); updateFollowTail(); });
+}
+function itemNode(item, { lazy = false } = {}) { if (item.type === "userMessage") return messageNode("user", textFromContent(item.content)); if (item.type === "agentMessage") return messageNode("assistant", item.text || ""); if (item.type === "reasoning") { const stream = createReasoningState(item); if (item.id) state.reasoningStreams.set(item.id, stream); return reasoningNode(item, stream); } return timelineItemNode(item, { lazy }); }
 function messageNode(role, text, pre = false) { const wrap = document.createElement("article"); wrap.className = `message ${role}`; const label = document.createElement("div"); label.className = "role"; label.textContent = role === "user" ? "你" : "Codex"; const content = document.createElement(pre ? "pre" : "div"); content.textContent = text; wrap.append(label, content); return wrap; }
 function reasoningNode(item = {}, stream = createReasoningState(item)) { const box = document.createElement("details"); box.className = "message reasoning"; box.open = stream.status === "inProgress"; const title = document.createElement("summary"); const content = document.createElement("div"); content.className = "reasoning-content"; box.append(title, content); updateReasoningNode(box, stream); return box; }
 function updateReasoningNode(node, stream) { const working = stream.status === "inProgress"; node.querySelector("summary").textContent = working ? "正在思考" : "思考过程"; node.querySelector(".reasoning-content").textContent = visibleReasoningText(stream) || (working ? "正在思考…" : "未提供推理摘要"); if (working) node.open = true; }
 function reasoningText(item = {}) { return reasoningTextFromItem(item); }
 function emptyNode(text) { const node = document.createElement("div"); node.className = "empty"; node.textContent = text; return node; }
 
-function renderRuntimeCards(plan, diff) {
-  if (plan) upsertTurnCard("plan", plan);
-  if (diff?.diff) upsertTurnCard("diff", diff);
+function renderRuntimeCards(plan, diff, { onlyMissing = false } = {}) {
+  const planId = String(plan?.turnId || "current"); const diffId = String(diff?.turnId || "current");
+  if (plan && (!onlyMissing || !$("messages").querySelector(`[data-turn-plan="${CSS.escape(planId)}"]`))) upsertTurnCard("plan", plan);
+  if (diff?.diff && (!onlyMissing || !$("messages").querySelector(`[data-turn-diff="${CSS.escape(diffId)}"]`))) upsertTurnCard("diff", diff);
 }
 function upsertTurnCard(type, payload) {
   clearEmptyMessages();
   const turnId = String(payload.turnId || "current");
   const selector = type === "plan" ? `[data-turn-plan="${CSS.escape(turnId)}"]` : `[data-turn-diff="${CSS.escape(turnId)}"]`;
-  const old = $("messages").querySelector(selector); const fresh = type === "plan" ? turnPlanNode(payload) : turnDiffNode(payload);
+  const old = $("messages").querySelector(selector); const fresh = type === "plan" ? turnPlanNode(payload) : turnDiffNode(payload, { lazy: true });
   if (old) old.replaceWith(fresh); else $("messages").append(fresh);
   scrollBottom();
 }
 function upsertItem(item) {
   if (!item?.id) return null;
-  const old = $("messages").querySelector(`[data-item-id="${CSS.escape(item.id)}"]`); const fresh = itemNode(item);
+  const old = findItemNode(item.id); const fresh = itemNode(item);
   if (!fresh) return old;
   fresh.dataset.itemId = item.id; clearEmptyMessages();
   if (old) old.replaceWith(fresh); else $("messages").append(fresh);
+  state.itemNodes.set(String(item.id), fresh);
   return fresh;
 }
 
@@ -418,7 +620,7 @@ async function sendMessage(event) {
   $("sendBtn").disabled = true;
   try {
     const result = await api(`/api/threads/${encodeURIComponent(state.current.id)}/messages`, { method: "POST", body: { text, mode, attachmentIds, model: $("modelSelect").value, effort: $("effortSelect").value, summary: $("summarySelect").value } });
-    $("messageInput").value = ""; autoSize(); clearAttachments(false);
+    $("messageInput").value = ""; clearDraft(); autoSize(); clearAttachments(false);
     if (result.queued) { toast("已加入队列"); await loadQueue(); }
     else if (result.turnId) { toast("已引导当前任务"); }
     else { state.activeTurnId = result.turn?.id || null; setActivity({ phase: "thinking", label: "正在思考", since: Date.now() }); scrollBottom(); }
@@ -426,7 +628,7 @@ async function sendMessage(event) {
 }
 
 function updateComposer() {
-  const can = state.control?.mode === "web" && state.control?.controller && state.current;
+  const can = state.control?.mode === "web" && state.control?.controller && state.current && !state.threadSyncing;
   for (const id of ["messageInput", "sendMode", "attachBtn", "sendBtn", "modelSelect", "effortSelect", "summarySelect"]) $(id).disabled = !can;
   $("interruptBtn").classList.add("hidden");
   $("sendBtn").classList.toggle("stop-mode", Boolean(state.activeTurnId));
@@ -444,7 +646,7 @@ function modelShortLabel() { const text = $("modelSelect").selectedOptions?.[0]?
 
 async function interruptTurn() { if (!state.current) return; try { await api(`/api/threads/${encodeURIComponent(state.current.id)}/interrupt`, { method: "POST", body: { turnId: state.activeTurnId } }); toast("已请求中断"); } catch (e) { toast(e.message); } }
 
-async function loadQueue() { if (!state.current) return; const q = await api(`/api/threads/${encodeURIComponent(state.current.id)}/queue`); state.queue = q.data || []; renderQueue(); }
+async function loadQueue() { if (!state.current) return; const threadId = state.current.id; return singleFlight(`queue:${threadId}`, async () => { const q = await api(`/api/threads/${encodeURIComponent(threadId)}/queue`); if (state.current?.id !== threadId) return; state.queue = q.data || []; renderQueue(); }); }
 function renderQueue() { const panel = $("queuePanel"); panel.classList.toggle("hidden", !state.queue.length); $("queueList").replaceChildren(...state.queue.map((item, index) => { const row = document.createElement("div"); row.className = "queue-item"; const content = document.createElement("div"); content.className = "queue-content"; const position = document.createElement("small"); position.textContent = index === 0 ? "下一条" : `第 ${index + 1} 条`; const text = document.createElement("span"); text.textContent = item.text || "[附件消息]"; content.append(position, text); const actions = document.createElement("div"); actions.className = "queue-actions"; const steer = document.createElement("button"); steer.className = "ghost"; steer.textContent = "立即引导"; steer.disabled = !state.activeTurnId; steer.title = state.activeTurnId ? "将这条排队消息立即发送为引导" : "当前没有运行中的任务；队列会自动发送"; steer.addEventListener("click", () => steerQueueItem(item.id)); const del = document.createElement("button"); del.className = "ghost"; del.textContent = "取消"; del.addEventListener("click", () => deleteQueueItem(item.id)); actions.append(steer, del); row.append(content, actions); return row; })); }
 async function steerQueueItem(id) { try { await api(`/api/threads/${encodeURIComponent(state.current.id)}/queue/${encodeURIComponent(id)}/steer`, { method: "POST" }); toast("已作为引导发出"); await loadQueue(); } catch (error) { toast(error.message); } }
 async function deleteQueueItem(id) { await api(`/api/threads/${encodeURIComponent(state.current.id)}/queue/${id}`, { method: "DELETE" }); await loadQueue(); }
@@ -452,6 +654,38 @@ async function clearQueue() { await api(`/api/threads/${encodeURIComponent(state
 
 function handlePaste(event) { const files = [...(event.clipboardData?.files || [])]; if (files.length) { event.preventDefault(); addFiles(files); } }
 async function addFiles(fileList) {
+  const freeSlots = Math.max(0, 10 - state.attachments.length);
+  const files = [...fileList].slice(0, freeSlots);
+  if ([...fileList].length > freeSlots) toast("最多可同时添加 10 个附件");
+  for (const file of files) await queueUpload(file);
+}
+async function queueUpload(file) {
+  if (!file?.size) return toast("无法上传空文件");
+  if (file.size > 50 * 1024 * 1024) return toast(`${file.name || "文件"} 超过 50MB`);
+  const clientId = crypto.randomUUID();
+  const entry = { clientId, name: file.name || "clipboard.png", size: file.size, mime: file.type || "application/octet-stream", file, status: "uploading", progress: 0 };
+  state.attachments.push(entry); renderAttachments();
+  try {
+    const result = await uploadFile(file, clientId, (progress) => { entry.progress = progress; renderAttachments(); });
+    Object.assign(entry, result, { status: "ready", progress: 100 }); delete entry.file; renderAttachments();
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    entry.status = "failed"; entry.error = error.message || "上传失败"; renderAttachments(); toast(`${entry.name}：${entry.error}`);
+  }
+}
+function uploadFile(file, clientId, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(); uploadTransfers.set(clientId, xhr);
+    xhr.open("POST", `/api/uploads?name=${encodeURIComponent(file.name || "clipboard.png")}&type=${encodeURIComponent(file.type || "application/octet-stream")}`);
+    xhr.withCredentials = true; xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress?.(Math.max(1, Math.min(99, Math.round(event.loaded / event.total * 100)))); };
+    xhr.onload = () => { uploadTransfers.delete(clientId); let data = {}; try { data = JSON.parse(xhr.responseText || "{}"); } catch { } if (xhr.status >= 200 && xhr.status < 300) resolve(data); else reject(new Error(data.error || `HTTP ${xhr.status}`)); };
+    xhr.onerror = () => { uploadTransfers.delete(clientId); reject(new Error("上传连接中断，可点击重试")); };
+    xhr.onabort = () => { uploadTransfers.delete(clientId); reject(new DOMException("Aborted", "AbortError")); };
+    xhr.send(file);
+  });
+}
+async function legacyAddFiles(fileList) {
   const files = [...fileList].slice(0, Math.max(0, 10 - state.attachments.length));
   for (const file of files) {
     if (file.size > 50 * 1024 * 1024) { toast(`${file.name} 超过 50MB`); continue; }
@@ -460,10 +694,28 @@ async function addFiles(fileList) {
     } catch (error) { toast(`${file.name}：${error.message}`); }
   }
 }
-async function uploadFile(file) { const url = `/api/uploads?name=${encodeURIComponent(file.name || "clipboard.png")}&type=${encodeURIComponent(file.type || "application/octet-stream")}`; const response = await fetch(url, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/octet-stream" }, body: file }); const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); return data; }
-function renderAttachments() { $("attachmentTray").classList.toggle("hidden", !state.attachments.length); $("attachmentTray").replaceChildren(...state.attachments.map((item) => { const box = document.createElement("div"); box.className = "attachment"; if (item.previewUrl) { const img = document.createElement("img"); img.src = item.previewUrl; box.append(img); } const name = document.createElement("span"); name.textContent = item.name; const del = document.createElement("button"); del.textContent = "×"; del.addEventListener("click", () => removeAttachment(item.id)); box.append(name, del); return box; })); }
-async function removeAttachment(id) { await api(`/api/uploads/${id}`, { method: "DELETE" }); state.attachments = state.attachments.filter((a) => a.id !== id); renderAttachments(); }
-function clearAttachments(removeRemote = true) { const old = state.attachments; state.attachments = []; renderAttachments(); if (removeRemote) for (const item of old) api(`/api/uploads/${item.id}`, { method: "DELETE" }).catch(() => {}); }
+async function legacyUploadFile(file) { const url = `/api/uploads?name=${encodeURIComponent(file.name || "clipboard.png")}&type=${encodeURIComponent(file.type || "application/octet-stream")}`; const response = await fetch(url, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/octet-stream" }, body: file }); const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); return data; }
+function renderAttachments() {
+  const tray = $("attachmentTray"); tray.classList.toggle("hidden", !state.attachments.length); tray.replaceChildren(...state.attachments.map((item) => {
+    const box = document.createElement("div"); box.className = `attachment attachment-${item.status || "ready"}`;
+    if (item.previewUrl) { const img = document.createElement("img"); img.src = item.previewUrl; img.alt = item.name; box.append(img); }
+    const content = document.createElement("div"); content.className = "attachment-content";
+    const name = document.createElement("strong"); name.textContent = item.name; content.append(name);
+    const detail = document.createElement("small"); detail.textContent = item.status === "uploading" ? `正在上传 ${item.progress || 0}%` : item.status === "failed" ? (item.error || "上传失败") : formatFileSize(item.size); content.append(detail);
+    if (item.status === "uploading") { const progress = document.createElement("i"); progress.className = "attachment-progress"; progress.style.setProperty("--upload-progress", `${item.progress || 0}%`); content.append(progress); }
+    const actions = document.createElement("div"); actions.className = "attachment-actions";
+    if (item.status === "failed" && item.file) { const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试"; retry.addEventListener("click", () => retryUpload(item.clientId)); actions.append(retry); }
+    const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = item.status === "uploading" ? "取消" : "×"; cancel.title = item.status === "uploading" ? "取消上传" : "移除附件"; cancel.addEventListener("click", () => removeAttachment(item.clientId || item.id)); actions.append(cancel);
+    box.append(content, actions); return box;
+  }));
+}
+function formatFileSize(value) { const bytes = Number(value || 0); if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`; return `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
+async function retryUpload(clientId) { const item = state.attachments.find((entry) => entry.clientId === clientId); if (!item?.file) return; item.status = "uploading"; item.progress = 0; item.error = ""; renderAttachments(); try { const result = await uploadFile(item.file, clientId, (progress) => { item.progress = progress; renderAttachments(); }); Object.assign(item, result, { status: "ready", progress: 100 }); delete item.file; renderAttachments(); } catch (error) { if (error.name !== "AbortError") { item.status = "failed"; item.error = error.message; renderAttachments(); } } }
+async function removeAttachment(key) { const item = state.attachments.find((entry) => entry.clientId === key || entry.id === key); if (!item) return; uploadTransfers.get(item.clientId)?.abort(); uploadTransfers.delete(item.clientId); state.attachments = state.attachments.filter((entry) => entry !== item); renderAttachments(); if (item.id) await api(`/api/uploads/${item.id}`, { method: "DELETE" }).catch(() => {}); }
+function clearAttachments(removeRemote = true) { const old = state.attachments; state.attachments = []; renderAttachments(); for (const item of old) uploadTransfers.get(item.clientId)?.abort(); uploadTransfers.clear(); if (removeRemote) for (const item of old) if (item.id) api(`/api/uploads/${item.id}`, { method: "DELETE" }).catch(() => {}); }
+function legacyRenderAttachments() { $("attachmentTray").classList.toggle("hidden", !state.attachments.length); $("attachmentTray").replaceChildren(...state.attachments.map((item) => { const box = document.createElement("div"); box.className = "attachment"; if (item.previewUrl) { const img = document.createElement("img"); img.src = item.previewUrl; box.append(img); } const name = document.createElement("span"); name.textContent = item.name; const del = document.createElement("button"); del.textContent = "×"; del.addEventListener("click", () => removeAttachment(item.id)); box.append(name, del); return box; })); }
+async function legacyRemoveAttachment(id) { await api(`/api/uploads/${id}`, { method: "DELETE" }); state.attachments = state.attachments.filter((a) => a.id !== id); renderAttachments(); }
+function legacyClearAttachments(removeRemote = true) { const old = state.attachments; state.attachments = []; renderAttachments(); if (removeRemote) for (const item of old) api(`/api/uploads/${item.id}`, { method: "DELETE" }).catch(() => {}); }
 
 function connectEvents() {
   if (state.socket?.readyState === WebSocket.OPEN || state.socket?.readyState === WebSocket.CONNECTING) return;
@@ -471,7 +723,16 @@ function connectEvents() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${scheme}://${location.host}/events?since=${encodeURIComponent(state.lastEventSeq)}`);
   state.socket = socket;
-  socket.onopen = () => { if (state.socket !== socket) return; state.socketConnected = true; state.reconnectCount += 1; renderActivity(); };
+  socket.onopen = () => {
+    if (state.socket !== socket) return;
+    const reconnecting = state.socketEverConnected;
+    state.socketEverConnected = true;
+    state.socketConnected = true;
+    clearTimeout(state.reconnectStableTimer);
+    state.reconnectStableTimer = setTimeout(() => { state.reconnectCount = 0; }, 10_000);
+    renderActivity();
+    if (reconnecting) void resyncAfterGap();
+  };
   socket.onmessage = ({ data }) => {
     if (state.socket !== socket) return;
     let event; try { event = JSON.parse(data); } catch { return; }
@@ -490,8 +751,9 @@ function connectEvents() {
   };
   socket.onclose = () => {
     if (state.socket !== socket) return;
-    state.socketConnected = false; state.socket = null; renderActivity();
-    state.reconnectTimer = setTimeout(() => { if (!document.hidden) connectEvents(); }, Math.min(10_000, 1_000 + state.reconnectCount * 750));
+    state.socketConnected = false; state.socket = null; clearTimeout(state.reconnectStableTimer); state.reconnectCount = Math.min(8, state.reconnectCount + 1); renderActivity();
+    const delay = Math.min(10_000, 500 * 2 ** state.reconnectCount);
+    state.reconnectTimer = setTimeout(() => { if (!document.hidden && navigator.onLine !== false) connectEvents(); }, delay);
   };
 }
 
@@ -505,6 +767,9 @@ async function resyncAfterGap() {
       const result = await api(`/api/threads/${encodeURIComponent(currentId)}`);
       applyThreadResult(result, currentId);
       await loadQueue();
+    } else if (currentId) {
+      const snapshot = await api(`/api/threads/${encodeURIComponent(currentId)}/snapshot`);
+      if (snapshot?.thread) applyThreadResult(snapshot, currentId, { syncing: true, restoreScroll: $("messages").scrollTop });
     }
     toast("连接已恢复，对话状态已同步");
   } catch (error) { toast(`恢复对话失败：${error.message}`); }
@@ -517,7 +782,7 @@ async function resyncAfterGap() {
 
 function handleEvent(event) {
   if (event.seq) state.lastEventSeq = Math.max(state.lastEventSeq, Number(event.seq));
-  if (event.type === "control") return refreshControl().catch(() => {});
+  if (event.type === "control") { const modeChanged = state.control?.mode !== event.data?.mode; state.control = { ...(state.control || {}), ...(event.data || {}) }; renderControl(); scheduleControlRefresh(modeChanged); return; }
   if (event.type === "hostUpdate") { $("updateBanner").classList.remove("hidden"); $("updateDetail").textContent = "主机正在准备更新，服务即将短暂重启…"; $("updateNowBtn").disabled = true; return; }
   if (event.type === "heartbeat") return;
   if (event.type === "activity" && state.current?.id === event.data.threadId) return setActivity(event.data.activity);
@@ -531,31 +796,85 @@ function handleEvent(event) {
   if (method === "thread/tokenUsage/updated") state.tokenUsage = params.tokenUsage || null;
   if (method === "account/rateLimits/updated" && !$("usageModal").classList.contains("hidden")) scheduleUsageRefresh();
   if (method === "thread/status/changed") applyThreadStatus(params.status);
-  if (method === "turn/started") { state.activeTurnId = params.turn?.id; state.threadStatus = { type: "active", activeFlags: [] }; setActivity({ phase: "thinking", label: "正在思考", since: Date.now() }); updateComposer(); renderQueue(); loadQueue().catch(() => {}); }
+  if (method === "turn/started") { state.activeTurnId = params.turn?.id; state.threadStatus = { type: "active", activeFlags: [] }; setActivity({ phase: "thinking", label: "正在思考", since: Date.now() }); updateComposer(); renderQueue(); }
   if (method === "turn/plan/updated") upsertTurnCard("plan", params);
   if (method === "turn/diff/updated") upsertTurnCard("diff", params);
   if (method === "item/started") { setActivity({ phase: params.item?.type || "working", label: activityLabel(params.item), detail: activityDetail(params.item), since: Date.now() }); upsertItem(params.item); scrollBottom(); }
-  if (method === "item/agentMessage/delta") { let node = [...document.querySelectorAll(".message.assistant")].findLast((el) => el.dataset.itemId === params.itemId); if (!node) { clearEmptyMessages(); node = messageNode("assistant", ""); node.dataset.itemId = params.itemId; $("messages").append(node); } node.lastElementChild.textContent += params.delta || ""; scrollBottom(); }
-  if (method === "item/reasoning/summaryPartAdded") { const { node, stream } = reasoningItem(params.itemId); ensureReasoningPart(stream, "summary", params.summaryIndex); updateReasoningNode(node, stream); }
-  if (method === "item/reasoning/summaryTextDelta") { const { node, stream } = reasoningItem(params.itemId); appendReasoningDelta(stream, "summary", params.summaryIndex, params.delta); updateReasoningNode(node, stream); scrollBottom(); }
-  if (method === "item/reasoning/textDelta") { const { node, stream } = reasoningItem(params.itemId); appendReasoningDelta(stream, "content", params.contentIndex, params.delta); updateReasoningNode(node, stream); scrollBottom(); }
-  if (method === "item/commandExecution/outputDelta") appendCommandOutput(findItemNode(params.itemId), params.delta);
-  if (method === "item/commandExecution/terminalInteraction") appendTerminalInput(findItemNode(params.itemId), params.stdin);
+  if (method === "item/agentMessage/delta") queueStreamAction("agent", params.itemId, params.delta);
+  if (method === "item/reasoning/summaryPartAdded") { const { stream } = reasoningItem(params.itemId, false); ensureReasoningPart(stream, "summary", params.summaryIndex); queueReasoningRender(params.itemId); }
+  if (method === "item/reasoning/summaryTextDelta") { const { stream } = reasoningItem(params.itemId, false); appendReasoningDelta(stream, "summary", params.summaryIndex, params.delta); queueReasoningRender(params.itemId); }
+  if (method === "item/reasoning/textDelta") { const { stream } = reasoningItem(params.itemId, false); appendReasoningDelta(stream, "content", params.contentIndex, params.delta); queueReasoningRender(params.itemId); }
+  if (method === "item/commandExecution/outputDelta") queueStreamAction("command", params.itemId, params.delta);
+  if (method === "item/commandExecution/terminalInteraction") queueStreamAction("terminal", params.itemId, params.stdin);
   if (method === "item/fileChange/patchUpdated") upsertItem({ id: params.itemId, type: "fileChange", status: "inProgress", changes: params.changes || [] });
-  if (method === "item/fileChange/outputDelta") appendToolProgress(findItemNode(params.itemId), params.delta);
-  if (method === "item/mcpToolCall/progress") appendToolProgress(findItemNode(params.itemId), params.message);
+  if (method === "item/fileChange/outputDelta") queueStreamAction("progress", params.itemId, params.delta);
+  if (method === "item/mcpToolCall/progress") queueStreamAction("progress", params.itemId, params.message);
   if (method === "item/plan/delta") {
     let node = findItemNode(params.itemId); if (!node) node = upsertItem({ id: params.itemId, type: "plan", status: "inProgress", text: "" });
-    appendPlanDelta(node, params.delta);
+    queueStreamAction("plan", params.itemId, params.delta);
   }
   if (method === "item/agentMessage/delta") setActivity({ phase: "responding", label: "正在生成回复", since: state.activity?.phase === "responding" ? state.activity.since : Date.now() });
-  if (method === "item/completed") { if (params.item.type === "reasoning") { const stream = state.reasoningStreams.get(params.item.id) || createReasoningState(params.item); mergeCompletedReasoning(stream, params.item); state.reasoningStreams.set(params.item.id, stream); const old = findItemNode(params.item.id); const fresh = reasoningNode(params.item, stream); fresh.dataset.itemId = params.item.id; if (old) old.replaceWith(fresh); else $("messages").append(fresh); } else upsertItem(params.item); }
-  if (method === "turn/completed") { for (const item of params.turn?.items || []) upsertItem(item); state.activeTurnId = null; state.threadStatus = { type: "idle" }; setActivity(state.queue.length ? { phase: "queue", label: "正在准备下一条排队消息", since: Date.now() } : null); updateComposer(); renderQueue(); loadQueue().catch(() => {}); loadThreads().catch(() => {}); }
+  if (method === "item/completed") { flushStreamUpdates(); if (params.item.type === "reasoning") { const stream = state.reasoningStreams.get(params.item.id) || createReasoningState(params.item); mergeCompletedReasoning(stream, params.item); state.reasoningStreams.set(params.item.id, stream); const old = findItemNode(params.item.id); const fresh = reasoningNode(params.item, stream); fresh.dataset.itemId = params.item.id; if (old) old.replaceWith(fresh); else $("messages").append(fresh); state.itemNodes.set(String(params.item.id), fresh); } else upsertItem(params.item); }
+  if (method === "turn/completed") { flushStreamUpdates(); for (const item of params.turn?.items || []) upsertItem(item); cacheCompletedTurn(params.turn); state.activeTurnId = null; state.threadStatus = { type: "idle" }; setActivity(state.queue.length ? { phase: "queue", label: "正在准备下一条排队消息", since: Date.now() } : null); touchCurrentThread(); updateComposer(); renderQueue(); }
   if (method === "serverRequest/resolved") resolvePendingRequest(params.requestId);
   if (method === "error") toast(params.error?.message || params.message || "Codex 运行出错");
 }
 
-function findItemNode(id) { return id ? $("messages").querySelector(`[data-item-id="${CSS.escape(String(id))}"]`) : null; }
+function findItemNode(id) { if (!id) return null; const key = String(id); const cached = state.itemNodes.get(key); if (cached?.isConnected) return cached; const node = $("messages").querySelector(`[data-item-id="${CSS.escape(key)}"]`); if (node) state.itemNodes.set(key, node); else state.itemNodes.delete(key); return node; }
+function queueStreamAction(kind, itemId, value) {
+  const id = String(itemId || ""); if (!id) return;
+  const last = state.streamActions.at(-1);
+  if (last && last.kind === kind && last.id === id && ["agent", "command", "plan"].includes(kind)) last.value += String(value || "");
+  else state.streamActions.push({ kind, id, value: String(value || "") });
+  scheduleStreamFlush();
+}
+function queueReasoningRender(itemId) { if (itemId != null) state.reasoningDirty.add(String(itemId)); scheduleStreamFlush(); }
+function scheduleStreamFlush() { if (!state.streamFrame) state.streamFrame = requestAnimationFrame(flushStreamUpdates); }
+function flushStreamUpdates() {
+  if (state.streamFrame) cancelAnimationFrame(state.streamFrame);
+  state.streamFrame = 0;
+  const actions = state.streamActions.splice(0); const reasoningIds = [...state.reasoningDirty]; state.reasoningDirty.clear();
+  if (!actions.length && !reasoningIds.length) return;
+  for (const action of actions) {
+    let node = findItemNode(action.id);
+    if (action.kind === "agent") {
+      if (!node) { clearEmptyMessages(); node = messageNode("assistant", ""); node.dataset.itemId = action.id; $("messages").append(node); state.itemNodes.set(action.id, node); }
+      node.lastElementChild.textContent += action.value;
+    } else if (action.kind === "command") appendCommandOutput(node, action.value);
+    else if (action.kind === "terminal") appendTerminalInput(node, action.value);
+    else if (action.kind === "plan") appendPlanDelta(node, action.value);
+    else if (action.kind === "progress") appendToolProgress(node, action.value);
+  }
+  for (const id of reasoningIds) { const { node, stream } = reasoningItem(id); updateReasoningNode(node, stream); }
+  scrollBottom();
+}
+function resetMessageCaches() {
+  if (state.streamFrame) cancelAnimationFrame(state.streamFrame);
+  state.streamFrame = 0; state.streamActions.length = 0; state.reasoningDirty.clear(); state.reasoningStreams.clear(); state.itemNodes.clear();
+}
+function touchCurrentThread() {
+  const index = state.threads.findIndex((thread) => thread.id === state.current?.id); if (index < 0) return;
+  const [thread] = state.threads.splice(index, 1); thread.recencyAt = Date.now(); state.threads.unshift(thread); renderThreads();
+}
+function rememberThreadView(id, result, scrollTop = 0) {
+  if (!id || !result?.thread) return;
+  state.threadViews.delete(id); state.threadViews.set(id, { result, scrollTop: Number(scrollTop || 0), savedAt: Date.now() });
+  while (state.threadViews.size > THREAD_VIEW_LIMIT) state.threadViews.delete(state.threadViews.keys().next().value);
+}
+function readThreadView(id) { const view = state.threadViews.get(id); if (!view) return null; state.threadViews.delete(id); state.threadViews.set(id, view); return view; }
+function saveCurrentThreadView() {
+  const id = state.current?.id; if (!id) return;
+  const existing = state.threadViews.get(id)?.result || {};
+  rememberThreadView(id, { ...existing, thread: state.current, threadSettings: state.currentSettings, tokenUsage: state.tokenUsage }, $("messages").scrollTop);
+}
+function cacheCompletedTurn(turn) {
+  if (!state.current || !turn) return;
+  const turns = [...(state.current.turns || [])]; const index = turn.id ? turns.findIndex((item) => item.id === turn.id) : -1;
+  if (index >= 0) turns[index] = turn; else turns.push(turn);
+  state.current = { ...state.current, turns, status: { type: "idle" }, recencyAt: Date.now() };
+  saveCurrentThreadView();
+}
+function delay(ms, signal) { return new Promise((resolve, reject) => { const timer = setTimeout(resolve, ms); signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new DOMException("Aborted", "AbortError")); }, { once: true }); }); }
 function mergePendingRequests(...groups) { const map = new Map(); for (const group of groups) for (const item of group || []) if (item?.id != null) map.set(String(item.id), item); return [...map.values()]; }
 function receiveServerRequest(request) { state.pendingRequests = mergePendingRequests(state.pendingRequests, [request]); renderInteraction(); }
 function resolvePendingRequest(id) { state.pendingRequests = state.pendingRequests.filter((request) => String(request.id) !== String(id)); renderInteraction(); }
@@ -657,11 +976,15 @@ async function submitServerRequest(id, body) { try { await api(`/api/server-requ
 function hideInteraction() { $("approval").classList.add("hidden"); $("approval").replaceChildren(); delete $("approval").dataset.requestId; }
 function prettyJson(value) { try { return JSON.stringify(value ?? {}, null, 2); } catch { return String(value); } }
 
-function setActivity(activity) { state.activity = typeof activity === "string" ? { phase: "working", label: activity, since: Date.now() } : activity; renderActivity(); }
+function setActivity(activity) {
+  const next = typeof activity === "string" ? { phase: "working", label: activity, since: Date.now() } : activity;
+  if (state.activity === next || (state.activity && next && state.activity.phase === next.phase && state.activity.label === next.label && state.activity.detail === next.detail && state.activity.since === next.since)) return;
+  state.activity = next; renderActivity();
+}
 function renderActivity() { const box = $("activityStatus"); if (!box) return; const disconnected = !state.socketConnected && state.control?.mode === "web"; const activity = disconnected ? { label: "连接断开，正在重连", since: Date.now() } : state.activity; box.classList.toggle("hidden", !activity); box.classList.toggle("offline", disconnected); if (!activity) return; const seconds = Math.max(0, Math.floor((Date.now() - Number(activity.since || Date.now())) / 1000)); const detail = activity.detail ? ` · ${activity.detail}` : ""; box.lastElementChild.textContent = `${activity.label}${seconds ? ` · ${seconds}秒` : ""}${detail}`; }
 function activityLabel(item = {}) { const labels = { reasoning: "正在思考", commandExecution: "正在执行命令", fileChange: "正在修改文件", webSearch: "正在搜索", mcpToolCall: "正在调用工具", dynamicToolCall: "正在调用工具", imageGeneration: "正在生成图片" }; return labels[item.type] || "正在处理"; }
 function activityDetail(item = {}) { return item.type === "commandExecution" ? String(item.command || "").replace(/\s+/g, " ").slice(0, 80) : ""; }
-function reasoningItem(itemId) { const id = String(itemId || ""); let stream = state.reasoningStreams.get(id); if (!stream) { stream = createReasoningState({ status: "inProgress" }); state.reasoningStreams.set(id, stream); } let node = document.querySelector(`.reasoning[data-item-id="${CSS.escape(id)}"]`); if (!node) { clearEmptyMessages(); node = reasoningNode({ status: "inProgress" }, stream); node.dataset.itemId = id; $("messages").append(node); } return { node, stream }; }
+function reasoningItem(itemId, createNode = true) { const id = String(itemId || ""); let stream = state.reasoningStreams.get(id); if (!stream) { stream = createReasoningState({ status: "inProgress" }); state.reasoningStreams.set(id, stream); } let node = findItemNode(id); if (!node && createNode) { clearEmptyMessages(); node = reasoningNode({ status: "inProgress" }, stream); node.dataset.itemId = id; $("messages").append(node); state.itemNodes.set(id, node); } return { node, stream }; }
 function clearEmptyMessages() { for (const node of $("messages").querySelectorAll(":scope > .empty")) node.remove(); }
 
 function applyThreadSettings(settings) {
@@ -708,6 +1031,7 @@ async function loadUsage() {
   try {
     state.usage = await api("/api/account/usage");
     renderUsage(state.usage);
+    renderAccountTokenTimeline(state.usage);
     $("usageLoading").classList.add("hidden");
     $("usageContent").classList.remove("hidden");
   } catch (error) {
@@ -742,6 +1066,35 @@ function renderUsage(payload = {}) {
   $("usageMessage").textContent = snapshot.rateLimitReachedType ? "当前使用限额已达到上限。" : "";
 }
 
+function renderAccountTokenTimeline(payload = {}) {
+  const now = new Date();
+  const dayKey = (date) => {
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+    return local.toISOString().slice(0, 10);
+  };
+  const today = dayKey(now);
+  const weekStart = new Date(now); weekStart.setHours(0, 0, 0, 0); weekStart.setDate(weekStart.getDate() - 6);
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const buckets = Array.isArray(payload.usage?.dailyUsageBuckets) ? payload.usage.dailyUsageBuckets : [];
+  const observed = Array.isArray(payload.history?.observed) ? payload.history.observed : [];
+  const sumOfficial = (from) => buckets.filter((item) => item?.startDate >= dayKey(from)).reduce((sum, item) => sum + Math.max(0, Number(item?.tokens || 0)), 0);
+  const sumObserved = (from) => observed.filter((item) => Number(item?.at) >= from.getTime()).reduce((total, item) => ({ input: total.input + Math.max(0, Number(item?.input || 0)), output: total.output + Math.max(0, Number(item?.output || 0)), cached: total.cached + Math.max(0, Number(item?.cached || 0)) }), { input: 0, output: 0, cached: 0 });
+  const hourStart = new Date(now.getTime() - 60 * 60_000);
+  const hour = sumObserved(hourStart);
+  const month = sumObserved(monthStart);
+  const officialDay = buckets.find((item) => item?.startDate === today)?.tokens;
+  const dayObserved = sumObserved(new Date(now.getFullYear(), now.getMonth(), now.getDate()));
+  $("usageHourTokens").textContent = formatCount(hour.input + hour.output);
+  $("usageDayTokens").textContent = Number.isFinite(Number(officialDay)) ? formatCount(officialDay) : formatCount(dayObserved.input + dayObserved.output);
+  $("usageWeekTokens").textContent = formatCount(sumOfficial(weekStart));
+  $("usageMonthTokens").textContent = formatCount(sumOfficial(monthStart));
+  $("usageInputTokens").textContent = formatCount(month.input);
+  $("usageOutputTokens").textContent = formatCount(month.output);
+  $("usageCacheTokens").textContent = formatCount(month.cached);
+  $("usageCacheRate").textContent = month.input ? `${Math.round(month.cached / month.input * 100)}%` : "--";
+  $("usageTimelineSource").textContent = "账号总量来自官方；输入、输出和缓存为本机网关本月观察值";
+}
+
 async function resetRateLimit() {
   const count = Number((state.usage?.rateLimits?.rateLimitResetCredits?.availableCount) || 0);
   if (!count) return;
@@ -765,11 +1118,34 @@ function formatResetTime(value) { const date = new Date(Number(value) * 1000); i
 function formatCount(value) { const count = Number(value); if (!Number.isFinite(count)) return "--"; return new Intl.NumberFormat("zh-CN", { notation: count >= 10_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(count); }
 function formatPlan(value) { const names = { free: "Free", go: "Go", plus: "Plus", pro: "Pro", prolite: "Pro Lite", team: "Team", business: "Business", enterprise: "Enterprise", edu: "Edu" }; return names[value] || value || "--"; }
 
-async function api(url, options = {}) { const response = await fetch(url, { method: options.method || "GET", credentials: "same-origin", headers: options.body ? { "Content-Type": "application/json" } : undefined, body: options.body ? JSON.stringify(options.body) : undefined }); if (response.status === 401 && options.allow401) return null; const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); return data; }
+async function api(url, options = {}) { const response = await fetch(url, { method: options.method || "GET", credentials: "same-origin", headers: options.body ? { "Content-Type": "application/json" } : undefined, body: options.body ? JSON.stringify(options.body) : undefined, signal: options.signal }); if (response.status === 401 && options.allow401) return null; const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); return data; }
+function singleFlight(key, operation) { if (inflightLoads.has(key)) return inflightLoads.get(key); const promise = Promise.resolve().then(operation).finally(() => inflightLoads.delete(key)); inflightLoads.set(key, promise); return promise; }
 function textFromContent(content = []) { return content.map((part) => part.text || (part.path ? `[图片：${part.path}]` : "")).filter(Boolean).join("\n"); }
 function formatDate(value) { if (!value) return ""; const date = new Date(typeof value === "number" && value < 10_000_000_000 ? value * 1000 : value); if (Number.isNaN(date.getTime())) return ""; return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date); }
-function scrollBottom() { requestAnimationFrame(() => { $("messages").scrollTop = $("messages").scrollHeight; }); }
-function autoSize() { const input = $("messageInput"); input.style.height = "auto"; input.style.height = `${Math.min(180, input.scrollHeight)}px`; }
+function updateFollowTail() { state.followTail = isNearBottom(); $("newMessagesBtn").classList.toggle("hidden", state.followTail); }
+function isNearBottom() { const messages = $("messages"); return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 140; }
+function scrollBottom(force = false) {
+  if (force) state.followTail = true;
+  if (!state.followTail) { $("newMessagesBtn").classList.remove("hidden"); return; }
+  if (state.scrollFrame) return;
+  state.scrollFrame = requestAnimationFrame(() => { state.scrollFrame = 0; const messages = $("messages"); messages.scrollTop = messages.scrollHeight; state.followTail = true; $("newMessagesBtn").classList.add("hidden"); });
+}
+let autoSizeFrame = 0;
+function autoSize() { if (autoSizeFrame) return; autoSizeFrame = requestAnimationFrame(() => { autoSizeFrame = 0; const input = $("messageInput"); input.style.height = "auto"; input.style.height = `${Math.min(180, input.scrollHeight)}px`; }); }
+function draftKey(threadId = state.current?.id) { return threadId ? `codex-web-draft:${threadId}` : ""; }
+function handleComposerInput() { autoSize(); clearTimeout(draftTimer); draftTimer = setTimeout(saveDraft, 180); }
+function saveDraft() {
+  clearTimeout(draftTimer); draftTimer = 0;
+  const key = draftKey(); if (!key) return;
+  const value = $("messageInput").value;
+  try { if (value) localStorage.setItem(key, value); else localStorage.removeItem(key); } catch { }
+}
+function restoreDraft(threadId) {
+  const key = draftKey(threadId); if (!key) return;
+  let value = ""; try { value = localStorage.getItem(key) || ""; } catch { }
+  $("messageInput").value = value; autoSize();
+}
+function clearDraft(threadId = state.current?.id) { const key = draftKey(threadId); if (key) try { localStorage.removeItem(key); } catch { } }
 let toastTimer; function toast(text) { clearTimeout(toastTimer); $("toast").textContent = text; $("toast").classList.remove("hidden"); toastTimer = setTimeout(() => $("toast").classList.add("hidden"), 4500); }
 
 if ("serviceWorker" in navigator && (location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname))) {

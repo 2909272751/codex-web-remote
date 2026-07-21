@@ -1,11 +1,12 @@
 {
   "name": "codex-web-remote",
-  "version": "1.4.2",
+  "version": "1.4.4",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check src/codex-client.mjs && node --check src/server-request.mjs && node --check src/terminal-session.mjs && node --check public/app.js && node --check public/reasoning-state.js && node --check public/timeline.js && node --check public/terminal.js && node --check scripts/reasoning-test.mjs && node --check scripts/server-request-test.mjs && node --check scripts/smoke-test.mjs && node --check scripts/web-integration-test.mjs && node --check scripts/mcp-browser-test.mjs && node --check scripts/clean-profile-test.mjs && node --check scripts/update-check-test.mjs && node --check scripts/pwa-test.mjs && node --check scripts/projects-test.mjs",
+    "check": "node --check server.mjs && node --check src/codex-client.mjs && node --check src/control-policy.mjs && node --check src/server-request.mjs && node --check src/terminal-session.mjs && node --check public/app.js && node --check public/reasoning-state.js && node --check public/timeline.js && node --check public/terminal.js && node --check scripts/control-policy-test.mjs && node --check scripts/reasoning-test.mjs && node --check scripts/server-request-test.mjs && node --check scripts/smoke-test.mjs && node --check scripts/web-integration-test.mjs && node --check scripts/mcp-browser-test.mjs && node --check scripts/clean-profile-test.mjs && node --check scripts/update-check-test.mjs && node --check scripts/pwa-test.mjs && node --check scripts/projects-test.mjs && node --check scripts/ui-performance-test.mjs",
+    "test:control": "node scripts/control-policy-test.mjs",
     "test:reasoning": "node scripts/reasoning-test.mjs",
     "test:requests": "node scripts/server-request-test.mjs",
     "test:browser-mcp": "node scripts/mcp-browser-test.mjs",
@@ -13,6 +14,7 @@
     "test:update": "node scripts/update-check-test.mjs",
     "test:pwa": "node scripts/pwa-test.mjs",
     "test:projects": "node scripts/projects-test.mjs",
+    "test:ui-performance": "node scripts/ui-performance-test.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "integration": "node scripts/web-integration-test.mjs"
   },

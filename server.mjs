@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocketServer } from "ws";
 import { CodexClient } from "./src/codex-client.mjs";
+import { canAutoYieldToDesktop } from "./src/control-policy.mjs";
 import { buildServerRequestResponse } from "./src/server-request.mjs";
 import { TerminalSession } from "./src/terminal-session.mjs";
 
@@ -22,8 +23,11 @@ const sessionMs = Math.max(1, Number(process.env.CODEX_WEB_SESSION_HOURS || 24))
 const dataDir = process.env.CODEX_WEB_DATA_DIR ? path.resolve(process.env.CODEX_WEB_DATA_DIR) : path.join(root, ".runtime-data");
 const queueFile = path.join(dataDir, "queues.json");
 const threadCacheFile = path.join(dataDir, "threads.json");
+const threadSnapshotDir = path.join(dataDir, "thread-snapshots");
 const sessionFile = path.join(dataDir, "sessions.json");
 const projectFile = path.join(dataDir, "projects.json");
+const controlAuditFile = path.join(dataDir, "control-audit.jsonl");
+const accountUsageHistoryFile = path.join(dataDir, "account-usage-history.json");
 const updateRequestFile = process.env.CODEX_WEB_UPDATE_REQUEST_FILE ? path.resolve(process.env.CODEX_WEB_UPDATE_REQUEST_FILE) : "";
 const updateApiUrl = process.env.CODEX_WEB_UPDATE_API || "https://api.github.com/repos/2909272751/codex-web-remote/releases/latest";
 const currentVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0";
@@ -31,6 +35,7 @@ const sessionIndexFile = path.join(process.env.USERPROFILE || root, ".codex", "s
 const sessionRoot = path.join(process.env.USERPROFILE || root, ".codex", "sessions");
 const uploadDir = process.env.CODEX_WEB_UPLOAD_DIR ? path.resolve(process.env.CODEX_WEB_UPLOAD_DIR) : path.join(process.env.USERPROFILE || root, ".codex", "web-uploads");
 const testMode = process.env.CODEX_WEB_TEST_MODE === "1";
+const testDesktopStateFile = testMode && process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE ? path.resolve(process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE) : "";
 const testDropTurnCompleted = testMode && process.env.CODEX_WEB_TEST_DROP_TURN_COMPLETED === "1";
 const defaultFullAccess = process.env.CODEX_WEB_DEFAULT_FULL_ACCESS !== "0";
 let testDropTurnCompletedRemaining = testDropTurnCompleted ? 1 : 0;
@@ -42,6 +47,7 @@ if (!password || password.length < 8) {
 
 await fsp.mkdir(dataDir, { recursive: true });
 await fsp.mkdir(uploadDir, { recursive: true });
+await fsp.mkdir(threadSnapshotDir, { recursive: true });
 
 const app = express();
 app.disable("x-powered-by");
@@ -54,15 +60,20 @@ const sockets = new Set();
 const uploads = new Map();
 const queues = await loadJson(queueFile, {});
 let projectStore = normalizeProjectStore(await loadJson(projectFile, { projects: [], hiddenPaths: [] }));
+let accountUsageHistory = normalizeAccountUsageHistory(await loadJson(accountUsageHistoryFile, { samples: [] }));
 const activeTurns = new Map();
 const threadActivities = new Map();
 const threadStatuses = new Map();
 const threadSettings = new Map();
 const threadTokenUsage = new Map();
+const tokenUsageBaselines = new Map();
 const turnPlans = new Map();
 const turnDiffs = new Map();
 const pendingApprovals = new Map();
 const readonlyThreadCache = new Map();
+const threadSnapshotCache = new Map();
+const readonlyThreadRequests = new Map();
+const threadActivationRequests = new Map();
 const queueWorkers = new Set();
 const queueRetryTimers = new Map();
 const threadSubmissions = new Set();
@@ -77,13 +88,20 @@ let lastThreadId = null;
 let resetCreditInFlight = false;
 let updateCache = null;
 let eventSeq = 0;
+let desktopConflictCheckInFlight = false;
+let lastControlAudit = await loadLastJsonLine(controlAuditFile);
 const eventBuffer = [];
 const eventBufferLimit = 1_000;
+const atomicJsonWrites = new Map();
 
 setInterval(cleanup, 60_000).unref();
 setInterval(() => broadcast({ type: "heartbeat", data: { at: Date.now() } }, false), 15_000).unref();
 setInterval(() => { if (mode === "web" && codex.ready) for (const threadId of Object.keys(queues)) if (queues[threadId]?.length) scheduleQueue(threadId, 0); }, 3000).unref();
-setInterval(async () => { if (mode === "terminal" && (await inspectDesktopProcesses()).running) await closeDesktop(true).catch((error) => broadcast({ type: "terminalConflict", data: { error: error.message } })); }, 5000).unref();
+setInterval(() => { void reconcileDesktopConflict(); }, 5000).unref();
+// Keep a lightweight account-level sample while the gateway is active. This is
+// deliberately separate from per-turn token events, which only describe work
+// that passed through this gateway.
+setInterval(() => { if (mode === "web" && codex.ready) void sampleAccountUsage(); }, 15 * 60_000).unref();
 
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -131,6 +149,7 @@ app.get("/api/control/status", requireAuth, asyncRoute(async (req, res) => {
     controller: mode === "web" || (mode === "terminal" && terminalControllerToken === req.sessionToken),
     controllerBusy: mode === "terminal" && Boolean(terminalControllerToken && terminalControllerToken !== req.sessionToken),
     sharedWebControl: mode === "web",
+    webClientCount: sockets.size,
     activeTurns: Object.fromEntries(activeTurns),
     activities: Object.fromEntries(threadActivities),
     threadStatuses: Object.fromEntries(threadStatuses),
@@ -141,13 +160,17 @@ app.get("/api/control/status", requireAuth, asyncRoute(async (req, res) => {
     pendingRequests: [...pendingApprovals.values()],
     queuedByThread: Object.fromEntries(Object.entries(queues).map(([id, list]) => [id, list.length])),
     queuedCount: Object.values(queues).reduce((sum, list) => sum + list.length, 0),
-    lastThreadId,
+    lastThreadId, lastControlAudit,
   });
 }));
 
 app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
+  await recordControlAudit("takeover-requested", req, { force: Boolean(req.body?.force) });
   if (transition) return res.status(409).json({ error: "正在切换状态" });
-  if (mode === "web" && codex.ready) return res.json({ ok: true, alreadyControlled: true, shared: true });
+  if (mode === "web" && codex.ready) {
+    await recordControlAudit("takeover-shared", req);
+    return res.json({ ok: true, alreadyControlled: true, shared: true });
+  }
   transition = true; setTakeoverState("checking", "正在检查桌面 Codex");
   try {
     const desktop = await inspectDesktopProcesses();
@@ -165,15 +188,18 @@ app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(asy
     terminalControllerToken = null;
     mode = "web";
     setTakeoverState("ready", "接管成功");
+    await recordControlAudit("takeover-completed", req);
     res.json({ ok: true });
   } catch (error) {
     setTakeoverState("failed", error.message || "接管失败");
     mode = (await inspectDesktopProcesses()).running ? "desktop" : "available";
+    await recordControlAudit("takeover-failed", req, { error: error.message || "接管失败" });
     throw error;
   } finally { transition = false; broadcastState(); }
 }));
 
 app.post("/api/control/release", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  await recordControlAudit("release-requested", req);
   if (transition) return res.status(409).json({ error: "正在切换状态" });
   if (mode === "web" && (activeTurns.size || threadSubmissions.size)) return res.status(409).json({ error: "仍有任务正在运行或启动，请等待或中断" });
   const queued = Object.values(queues).reduce((sum, list) => sum + list.length, 0);
@@ -186,6 +212,7 @@ app.post("/api/control/release", requireAuth, requireController, requireSameOrig
     mode = "desktop";
     terminalControllerToken = null;
     await launchDesktop(String(req.body?.threadId || lastThreadId || ""));
+    await recordControlAudit("release-completed", req);
     res.json({ ok: true });
   } finally { transition = false; broadcastState(); }
 }));
@@ -337,7 +364,8 @@ app.get("/api/account/usage", requireAuth, requireWebMode, asyncRoute(async (req
   const rateLimits = await codex.request("account/rateLimits/read", null);
   let usage = null;
   try { usage = await codex.request("account/usage/read", null); } catch { }
-  res.json({ rateLimits, usage });
+  if (usage) await recordAccountUsageSample(usage);
+  res.json({ rateLimits, usage, history: accountUsageHistory });
 }));
 
 app.post("/api/account/rate-limit-reset", requireAuth, requireWebMode, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -357,20 +385,21 @@ app.get("/api/thread-previews", requireAuth, asyncRoute(async (req, res) => {
   res.json({ data: await readThreadPreviews() });
 }));
 
+app.get("/api/threads/:id/snapshot", requireAuth, asyncRoute(async (req, res) => {
+  const cached = await readThreadSnapshot(req.params.id);
+  const thread = cached?.thread || await readReadonlyThreadSingleFlight(req.params.id);
+  if (!thread) return res.status(404).json({ error: "暂时没有该任务的本地快照" });
+  if (!cached) void writeThreadSnapshot(thread).catch(() => {});
+  res.json({ thread, cached: true, cachedAt: cached?.cachedAt || null, ...threadRuntimePayload(req.params.id) });
+}));
+
 app.get("/api/threads/:id", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
-  const result = await resumeThread(req.params.id, { recoverEmpty: true })
-    || await codex.request("thread/read", { threadId: req.params.id, includeTurns: !testMode });
+  const result = await activateThread(req.params.id);
   lastThreadId = req.params.id;
   await mergeThreadCache(result.thread);
   syncThreadRuntime(result.thread);
-  res.json({
-    ...result,
-    threadSettings: threadSettings.get(req.params.id) || null,
-    tokenUsage: threadTokenUsage.get(req.params.id) || null,
-    turnPlan: turnPlans.get(req.params.id) || null,
-    turnDiff: turnDiffs.get(req.params.id) || null,
-    pendingRequests: [...pendingApprovals.values()].filter((item) => item.params?.threadId === req.params.id),
-  });
+  void writeThreadSnapshot(result.thread).catch(() => {});
+  res.json({ ...result, ...threadRuntimePayload(req.params.id) });
 }));
 
 app.get("/api/thread-previews/:id", requireAuth, asyncRoute(async (req, res) => {
@@ -521,13 +550,14 @@ server.on("upgrade", (req, socket, head) => {
 });
 wss.on("connection", (ws, req) => {
   sockets.add(ws);
+  broadcastState();
   const requestUrl = new URL(req.url || "/events", "http://localhost");
   const since = Math.max(0, Number(requestUrl.searchParams.get("since") || 0) || 0);
   const oldest = eventBuffer[0]?.seq ?? (eventSeq + 1);
   const replayAvailable = since === 0 || (since <= eventSeq && since >= oldest - 1);
   ws.send(JSON.stringify({ type: "hello", data: { eventSeq, replayAvailable, oldestEventSeq: oldest } }));
   if (replayAvailable && since > 0) for (const event of eventBuffer) if (event.seq > since && ws.readyState === 1) ws.send(JSON.stringify(event));
-  ws.on("close", () => sockets.delete(ws));
+  ws.on("close", () => { sockets.delete(ws); broadcastState(); });
 });
 terminalWss.on("connection", (ws, req) => { if (terminalControllerToken !== req.sessionToken || mode !== "terminal") return ws.close(1008, "No terminal control"); if (terminal.buffer) ws.send(JSON.stringify({ type: "data", data: terminal.buffer })); ws.send(JSON.stringify({ type: "status", data: terminal.status() })); ws.on("message", (raw) => { try { const message = JSON.parse(String(raw)); if (message.type === "input") terminal.write(message.data); if (message.type === "resize") terminal.resize(Number(message.cols), Number(message.rows)); } catch { } }); });
 terminal.on("data", (data) => { const body = JSON.stringify({ type: "data", data }); for (const ws of terminalWss.clients) if (ws.readyState === 1) ws.send(body); });
@@ -540,7 +570,7 @@ codex.on("notification", (data) => {
   if (dropTurnCompleted) testDropTurnCompletedRemaining -= 1;
   if (method === "serverRequest/resolved" && params?.requestId != null) pendingApprovals.delete(String(params.requestId));
   if (method === "thread/settings/updated" && threadId && params.threadSettings) threadSettings.set(threadId, params.threadSettings);
-  if (method === "thread/tokenUsage/updated" && threadId && params.tokenUsage) threadTokenUsage.set(threadId, params.tokenUsage);
+  if (method === "thread/tokenUsage/updated" && threadId && params.tokenUsage) { threadTokenUsage.set(threadId, params.tokenUsage); void recordObservedTokenUsage(threadId, params.tokenUsage); }
   if (method === "turn/plan/updated" && threadId) turnPlans.set(threadId, { turnId: params.turnId, plan: params.plan || [], explanation: params.explanation || "" });
   if (method === "turn/diff/updated" && threadId) turnDiffs.set(threadId, { turnId: params.turnId, diff: params.diff || "" });
   if (method === "thread/status/changed" && threadId && params.status) {
@@ -566,6 +596,7 @@ codex.on("notification", (data) => {
     activeTurns.delete(threadId);
     threadActivities.delete(threadId);
     threadStatuses.set(threadId, { type: "idle" });
+    void mergeThreadSnapshotTurn(threadId, params.turn).catch(() => {});
     scheduleQueue(threadId, 120);
   }
   broadcast({ type: "notification", data });
@@ -618,6 +649,28 @@ function scheduleQueue(threadId, delayMs = 100) {
   queueRetryTimers.set(threadId, timer);
 }
 
+function threadRuntimePayload(threadId) {
+  return {
+    threadSettings: threadSettings.get(threadId) || null,
+    tokenUsage: threadTokenUsage.get(threadId) || null,
+    turnPlan: turnPlans.get(threadId) || null,
+    turnDiff: turnDiffs.get(threadId) || null,
+    pendingRequests: [...pendingApprovals.values()].filter((item) => item.params?.threadId === threadId),
+  };
+}
+
+async function activateThread(threadId) {
+  if (threadActivationRequests.has(threadId)) return threadActivationRequests.get(threadId);
+  const request = (async () => {
+    const result = await resumeThread(threadId, { recoverEmpty: true })
+      || await codex.request("thread/read", { threadId, includeTurns: !testMode });
+    if (!result?.thread) throw new Error("Codex 未返回任务内容");
+    return result;
+  })().finally(() => threadActivationRequests.delete(threadId));
+  threadActivationRequests.set(threadId, request);
+  return request;
+}
+
 async function resumeThread(threadId, { recoverEmpty = false } = {}) {
   try {
     const result = await codex.request("thread/resume", { threadId, ...(testMode ? { excludeTurns: true } : {}), ...threadPermissionOverrides() });
@@ -642,6 +695,33 @@ async function resumeThread(threadId, { recoverEmpty = false } = {}) {
     if (/no rollout found/i.test(error.message)) return null;
     throw error;
   }
+}
+
+function threadSnapshotFile(threadId) { return path.join(threadSnapshotDir, `${crypto.createHash("sha256").update(String(threadId)).digest("hex")}.json`); }
+function rememberThreadSnapshot(threadId, value) {
+  threadSnapshotCache.delete(threadId); threadSnapshotCache.set(threadId, value);
+  while (threadSnapshotCache.size > 10) threadSnapshotCache.delete(threadSnapshotCache.keys().next().value);
+}
+async function readThreadSnapshot(threadId) {
+  if (threadSnapshotCache.has(threadId)) { const value = threadSnapshotCache.get(threadId); rememberThreadSnapshot(threadId, value); return value; }
+  const value = await loadJson(threadSnapshotFile(threadId), null);
+  if (!value?.thread?.id) return null;
+  rememberThreadSnapshot(threadId, value); return value;
+}
+async function writeThreadSnapshot(thread) {
+  if (!thread?.id || !Array.isArray(thread.turns)) return;
+  const value = { cachedAt: Date.now(), thread };
+  rememberThreadSnapshot(thread.id, value);
+  await atomicJson(threadSnapshotFile(thread.id), value);
+}
+async function mergeThreadSnapshotTurn(threadId, turn) {
+  if (!threadId || !turn) return;
+  const cached = await readThreadSnapshot(threadId);
+  if (!cached?.thread) return;
+  const turns = [...(cached.thread.turns || [])];
+  const index = turn.id ? turns.findIndex((item) => item.id === turn.id) : -1;
+  if (index >= 0) turns[index] = turn; else turns.push(turn);
+  await writeThreadSnapshot({ ...cached.thread, turns, status: { type: "idle" }, recencyAt: Date.now() });
 }
 
 async function recoverEmptyThread(threadId) {
@@ -748,6 +828,13 @@ async function readReadonlyThread(threadId) {
   return thread;
 }
 
+function readReadonlyThreadSingleFlight(threadId) {
+  if (readonlyThreadRequests.has(threadId)) return readonlyThreadRequests.get(threadId);
+  const request = readReadonlyThread(threadId).finally(() => readonlyThreadRequests.delete(threadId));
+  readonlyThreadRequests.set(threadId, request);
+  return request;
+}
+
 async function findSessionFile(threadId) {
   const suffix = `${threadId}.jsonl`;
   const stack = [sessionRoot];
@@ -828,6 +915,59 @@ async function projectCatalog() {
 
 async function saveProjects() { await atomicJson(projectFile, projectStore); }
 
+function normalizeAccountUsageHistory(value) {
+  const samples = Array.isArray(value?.samples) ? value.samples : [];
+  const observed = Array.isArray(value?.observed) ? value.observed : [];
+  return {
+    samples: samples.filter((item) => Number.isFinite(Number(item?.at)) && typeof item?.day === "string" && Number.isFinite(Number(item?.tokens))).slice(-2_000),
+    observed: observed.filter((item) => Number.isFinite(Number(item?.at))).map((item) => ({ at: Number(item.at), input: Math.max(0, Number(item.input || 0)), output: Math.max(0, Number(item.output || 0)), cached: Math.max(0, Number(item.cached || 0)) })).slice(-20_000),
+  };
+}
+async function recordAccountUsageSample(usage) {
+  const buckets = Array.isArray(usage?.dailyUsageBuckets) ? usage.dailyUsageBuckets : [];
+  const today = new Date().toISOString().slice(0, 10);
+  const tokens = Number(buckets.find((item) => item?.startDate === today)?.tokens);
+  if (!Number.isFinite(tokens)) return;
+  const last = accountUsageHistory.samples.at(-1);
+  if (last?.day === today && last.tokens === tokens && Date.now() - last.at < 15 * 60_000) return;
+  accountUsageHistory.samples.push({ at: Date.now(), day: today, tokens });
+  accountUsageHistory.samples = accountUsageHistory.samples.filter((item) => item.at >= Date.now() - 45 * 86400_000).slice(-2_000);
+  await atomicJson(accountUsageHistoryFile, accountUsageHistory);
+}
+function tokenValue(value, keys) {
+  const queue = [value]; const seen = new Set();
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || typeof current !== "object" || seen.has(current)) continue;
+    seen.add(current);
+    for (const key of keys) { const candidate = current[key]; if (Number.isFinite(Number(candidate))) return Math.max(0, Number(candidate)); }
+    for (const child of Object.values(current)) if (child && typeof child === "object") queue.push(child);
+  }
+  return 0;
+}
+function tokenBreakdown(usage) {
+  const input = tokenValue(usage, ["inputTokens", "input_tokens", "inputTokenCount"]);
+  const output = tokenValue(usage, ["outputTokens", "output_tokens", "outputTokenCount"]);
+  const cached = tokenValue(usage, ["cachedInputTokens", "cached_input_tokens", "cacheReadInputTokens", "cache_read_input_tokens"]);
+  return { input, output, cached };
+}
+async function recordObservedTokenUsage(threadId, usage) {
+  const next = tokenBreakdown(usage); const previous = tokenUsageBaselines.get(threadId);
+  tokenUsageBaselines.set(threadId, next);
+  if (!previous) return;
+  const delta = { input: Math.max(0, next.input - previous.input), output: Math.max(0, next.output - previous.output), cached: Math.max(0, next.cached - previous.cached) };
+  if (!delta.input && !delta.output && !delta.cached) return;
+  accountUsageHistory.observed.push({ at: Date.now(), ...delta });
+  accountUsageHistory.observed = accountUsageHistory.observed.filter((item) => item.at >= Date.now() - 45 * 86400_000).slice(-20_000);
+  await atomicJson(accountUsageHistoryFile, accountUsageHistory);
+}
+async function sampleAccountUsage() {
+  try {
+    const usage = await codex.request("account/usage/read", null);
+    if (usage) await recordAccountUsageSample(usage);
+  } catch { /* Account metrics are optional and must never disturb a task. */ }
+}
+
 function threadTime(thread) {
   const value = thread.recencyAt || thread.updatedAt || thread.createdAt || 0;
   if (typeof value === "number") return value < 10_000_000_000 ? value * 1000 : value;
@@ -843,7 +983,7 @@ async function saveThreadCache(threads) {
 
 async function mergeThreadCache(thread) { if (thread?.id) await saveThreadCache([thread]); }
 function broadcastQueue(threadId) { broadcast({ type: "queue", data: { threadId, items: queues[threadId] || [] } }); }
-function broadcastState() { broadcast({ type: "control", data: { mode, transition, takeoverState, fullAccess, ready: codex.ready } }); }
+function broadcastState() { broadcast({ type: "control", data: { mode, transition, takeoverState, fullAccess, ready: codex.ready, webClientCount: sockets.size, sharedWebControl: mode === "web" } }); }
 function broadcast(message, record = true) {
   const event = record ? { ...message, seq: ++eventSeq, at: Date.now() } : message;
   if (record) {
@@ -946,8 +1086,91 @@ function applyOfficialThreadStatus(threadId, status) {
   if (!threadActivities.has(threadId)) setThreadActivity(threadId, "working", "正在处理");
 }
 
+async function reconcileDesktopConflict() {
+  if (desktopConflictCheckInFlight || transition || !new Set(["web", "terminal"]).has(mode)) return;
+  desktopConflictCheckInFlight = true;
+  let ownsTransition = false;
+  try {
+    const desktop = await inspectDesktopProcesses();
+    if (!desktop.running) {
+      if (mode === "web" && takeoverState.phase === "desktop-conflict") {
+        setTakeoverState("ready", "桌面 App 已关闭，Web 继续运行");
+        broadcastState();
+      }
+      return;
+    }
+    if (mode === "terminal") {
+      await closeDesktop(true).catch((error) => broadcast({ type: "terminalConflict", data: { error: error.message } }));
+      return;
+    }
+
+    const queuedCount = Object.values(queues).reduce((sum, list) => sum + list.length, 0);
+    const canYield = canAutoYieldToDesktop({
+      activeTurnCount: activeTurns.size,
+      submissionCount: threadSubmissions.size,
+      queuedCount,
+      pendingRequestCount: pendingApprovals.size,
+    });
+    if (!canYield) {
+      if (takeoverState.phase !== "desktop-conflict") {
+        setTakeoverState("desktop-conflict", "桌面 App 已启动；Web 任务完成后将自动让路", desktop.processes);
+        await recordControlAudit("desktop-detected-web-busy", null, { processes: desktop.processes.length, queuedCount });
+        broadcastState();
+      }
+      return;
+    }
+
+    transition = true;
+    ownsTransition = true;
+    setTakeoverState("yielding", "检测到桌面 App，Web 正在自动让路", desktop.processes);
+    broadcastState();
+    await codex.stop();
+    fullAccess = defaultFullAccess;
+    terminalControllerToken = null;
+    mode = "desktop";
+    setTakeoverState("ready", "已自动让路给桌面 App", desktop.processes);
+    await recordControlAudit("auto-yield-to-desktop", null, { processes: desktop.processes.length });
+  } catch (error) {
+    if (!codex.ready) mode = "desktop";
+    setTakeoverState("failed", `自动让路失败：${error.message}`);
+    await recordControlAudit("auto-yield-failed", null, { error: error.message });
+  } finally {
+    if (ownsTransition) {
+      transition = false;
+      broadcastState();
+    }
+    desktopConflictCheckInFlight = false;
+  }
+}
+
+async function recordControlAudit(action, req = null, details = {}) {
+  const entry = {
+    at: new Date().toISOString(),
+    action,
+    mode,
+    clientIp: req ? clientIp(req) : "gateway",
+    userAgent: req ? String(req.get("user-agent") || "").slice(0, 240) : "",
+    ...details,
+  };
+  lastControlAudit = entry;
+  console.log(`control-audit ${JSON.stringify(entry)}`);
+  try { await fsp.appendFile(controlAuditFile, `${JSON.stringify(entry)}\n`, "utf8"); } catch (error) { console.error(`control-audit write failed: ${error.message}`); }
+  return entry;
+}
+
+async function loadLastJsonLine(file) {
+  try {
+    const lines = (await fsp.readFile(file, "utf8")).split(/\r?\n/).filter(Boolean);
+    return lines.length ? JSON.parse(lines.at(-1)) : null;
+  } catch { return null; }
+}
+
 async function inspectDesktopProcesses() {
-  if (testMode) return { running: false, processes: [] };
+  if (testMode) {
+    if (!testDesktopStateFile) return { running: false, processes: [] };
+    const state = await loadJson(testDesktopStateFile, { running: false, processes: [] });
+    return { running: Boolean(state.running), processes: Array.isArray(state.processes) ? state.processes : [] };
+  }
   const script = `
 $ErrorActionPreference='SilentlyContinue'
 $roots=@(Get-AppxPackage -Name 'OpenAI.Codex' | Select-Object -ExpandProperty InstallLocation)
@@ -1092,7 +1315,28 @@ function asyncRoute(handler) { return (req, res, next) => Promise.resolve(handle
 function sanitizeFileName(name) { return path.basename(name).replace(/[^\p{L}\p{N}._ -]/gu, "_").slice(0, 120) || "attachment"; }
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 async function loadJson(file, fallback) { try { return JSON.parse(await fsp.readFile(file, "utf8")); } catch { return fallback; } }
-async function atomicJson(file, value) { const temp = `${file}.tmp`; await fsp.writeFile(temp, JSON.stringify(value, null, 2)); await fsp.rename(temp, file); }
+function atomicJson(file, value) {
+  const previous = atomicJsonWrites.get(file) || Promise.resolve();
+  const write = previous.catch(() => {}).then(async () => {
+    const temp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+    await fsp.writeFile(temp, JSON.stringify(value, null, 2));
+    try {
+      for (let attempt = 0; ; attempt += 1) {
+        try { await fsp.rename(temp, file); break; }
+        catch (error) {
+          if (!(["EPERM", "EACCES", "EEXIST"].includes(error.code)) || attempt >= 4) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+        }
+      }
+    } catch (error) {
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "EEXIST"].includes(error.code)) throw error;
+      await fsp.copyFile(temp, file);
+      await fsp.unlink(temp).catch(() => {});
+    }
+  });
+  atomicJsonWrites.set(file, write);
+  return write.finally(() => { if (atomicJsonWrites.get(file) === write) atomicJsonWrites.delete(file); });
+}
 async function cleanup() {
   const now = Date.now();
   let sessionsChanged = false;

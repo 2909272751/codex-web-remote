@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.4.2"
+    [string]$Version = "1.4.4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,6 +52,18 @@ foreach ($developmentPath in @(
     if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
 }
 Move-Item -LiteralPath $deployDirectory -Destination $stageDirectory
+
+# node-pty ships native prebuilds for every desktop platform. This installer is
+# explicitly Windows x64, so retaining only its Windows x64 binary preserves
+# terminal support while avoiding needless macOS/ARM payload in every download.
+$ptyPrebuildDirectory = Join-Path $stageDirectory "node_modules\node-pty\prebuilds"
+if (Test-Path -LiteralPath $ptyPrebuildDirectory) {
+    Get-ChildItem -LiteralPath $ptyPrebuildDirectory -Directory | Where-Object { $_.Name -ne "win32-x64" } | ForEach-Object {
+        $resolved = $_.FullName
+        if (-not $resolved.StartsWith($stageDirectory, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to prune outside installer stage: $resolved" }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+}
 
 $launcher = Join-Path $publishDirectory "CodexWebRemote.exe"
 if (-not (Test-Path -LiteralPath $launcher)) { throw "Published launcher is missing." }

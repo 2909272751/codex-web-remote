@@ -1,4 +1,26 @@
-# Codex Web Remote v1.4.2
+# Codex Web Remote v1.4.4
+
+## Experience and reliability
+
+- Faster task switching with bounded history rendering and cached snapshots.
+- Upload progress, cancel/retry, per-task draft recovery, shared Web control state and safer reconnect recovery.
+- Responsive verification for phone, tablet and high-resolution desktop layouts.
+- Account usage now distinguishes official account totals from gateway-observed input, output and cached-token detail.
+
+---
+
+# Codex Web Remote v1.4.3
+
+## 桌面 App 保护
+
+- Web 模式下检测到桌面 Codex 启动时，如果 Web 空闲，会自动停止 Web app-server 并让路给桌面 App。
+- Web 有运行任务、排队消息、提交或审批时不会自动切换，也绝不会结束新启动的桌面进程。
+- 新增接管、释放、桌面冲突与自动让路审计记录，便于确认操作来源和发生时间。
+- 新增控制策略及完整服务回归测试，验证空闲自动让路、繁忙状态保持和多设备控制不受影响。
+
+---
+
+## v1.4.2
 
 ## 修复
 

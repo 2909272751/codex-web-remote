@@ -1,12 +1,12 @@
 const OUTPUT_LIMIT = 500_000;
 
-export function timelineItemNode(item = {}) {
+export function timelineItemNode(item = {}, { lazy = false } = {}) {
   switch (item.type) {
     case "plan": return planItem(item);
-    case "commandExecution": return commandItem(item);
-    case "fileChange": return fileChangeItem(item);
-    case "mcpToolCall": return mcpToolItem(item);
-    case "dynamicToolCall": return dynamicToolItem(item);
+    case "commandExecution": return commandItem(item, { lazy });
+    case "fileChange": return fileChangeItem(item, { lazy });
+    case "mcpToolCall": return mcpToolItem(item, { lazy });
+    case "dynamicToolCall": return dynamicToolItem(item, { lazy });
     case "collabAgentToolCall": return collabItem(item);
     case "subAgentActivity": return simpleItem(item, "agents", "子代理活动", `${item.agentPath || item.agentThreadId || "子代理"} · ${item.kind || "处理中"}`);
     case "webSearch": return webSearchItem(item);
@@ -35,12 +35,12 @@ export function turnPlanNode(payload = {}) {
   return node;
 }
 
-export function turnDiffNode(payload = {}) {
+export function turnDiffNode(payload = {}, { lazy = false } = {}) {
   const diff = String(payload.diff || "");
   const stats = diffStats(diff);
   const node = baseCard({ kind: "diff", icon: "±", title: "本轮代码变更", subtitle: stats.label, status: diff ? "completed" : "inProgress", open: false });
   node.dataset.turnDiff = String(payload.turnId || "current");
-  node.querySelector(".timeline-body").append(diffBlock(diff || "等待文件变更…"));
+  populateBody(node, lazy, (body) => body.append(diffBlock(diff || "等待文件变更…")));
   return node;
 }
 
@@ -72,39 +72,42 @@ export function appendToolProgress(node, message) {
   node.open = true;
 }
 
-function commandItem(item) {
+function commandItem(item, { lazy = false } = {}) {
   const action = item.commandActions?.[0]?.type;
   const labels = { read: "读取文件", listFiles: "列出文件", search: "搜索内容", unknown: "运行命令" };
   const node = baseCard({ kind: "command", icon: "›_", title: labels[action] || "运行命令", subtitle: compact(item.command), status: item.status, open: item.status === "inProgress" });
-  const body = node.querySelector(".timeline-body");
-  body.append(metaRow([
-    item.cwd && `目录：${item.cwd}`,
-    item.durationMs != null && `耗时：${formatDuration(item.durationMs)}`,
-    item.exitCode != null && `退出码：${item.exitCode}`,
-  ]));
-  body.append(section("命令", codeBlock(item.command || "")));
-  const output = codeBlock(item.aggregatedOutput || "等待输出…"); output.dataset.stream = "command";
-  if (!item.aggregatedOutput) output.dataset.placeholder = "true";
-  body.append(section("输出", output));
+  populateBody(node, lazy, (body) => {
+    body.append(metaRow([
+      item.cwd && `目录：${item.cwd}`,
+      item.durationMs != null && `耗时：${formatDuration(item.durationMs)}`,
+      item.exitCode != null && `退出码：${item.exitCode}`,
+    ]));
+    body.append(section("命令", codeBlock(item.command || "")));
+    const output = codeBlock(item.aggregatedOutput || "等待输出…"); output.dataset.stream = "command";
+    if (!item.aggregatedOutput) output.dataset.placeholder = "true";
+    body.append(section("输出", output));
+  });
   return node;
 }
 
-function fileChangeItem(item) {
+function fileChangeItem(item, { lazy = false } = {}) {
   const changes = Array.isArray(item.changes) ? item.changes : [];
   const totals = changes.reduce((sum, change) => { const stats = diffStats(change.diff || ""); sum.add += stats.add; sum.del += stats.del; return sum; }, { add: 0, del: 0 });
   const node = baseCard({ kind: "files", icon: "▤", title: `编辑 ${changes.length} 个文件`, subtitle: `+${totals.add} −${totals.del}`, status: item.status, open: item.status === "inProgress" });
-  const list = document.createElement("div"); list.className = "file-change-list";
-  for (const change of changes) {
-    const details = document.createElement("details"); details.className = "file-change";
-    const header = document.createElement("summary");
-    const kind = change.kind?.type || "update";
-    const badge = document.createElement("span"); badge.className = `file-kind ${kind}`; badge.textContent = ({ add: "新增", delete: "删除", update: "修改" })[kind] || kind;
-    const path = document.createElement("code"); path.textContent = change.path || "未知文件";
-    const stats = document.createElement("small"); stats.textContent = diffStats(change.diff || "").label;
-    header.append(badge, path, stats); details.append(header, diffBlock(change.diff || "暂无 Diff")); list.append(details);
-  }
-  if (!changes.length) { const waiting = document.createElement("p"); waiting.className = "timeline-muted"; waiting.textContent = "正在准备文件变更…"; list.append(waiting); }
-  node.querySelector(".timeline-body").append(list);
+  populateBody(node, lazy, (body) => {
+    const list = document.createElement("div"); list.className = "file-change-list";
+    for (const change of changes) {
+      const details = document.createElement("details"); details.className = "file-change";
+      const header = document.createElement("summary");
+      const kind = change.kind?.type || "update";
+      const badge = document.createElement("span"); badge.className = `file-kind ${kind}`; badge.textContent = ({ add: "新增", delete: "删除", update: "修改" })[kind] || kind;
+      const path = document.createElement("code"); path.textContent = change.path || "未知文件";
+      const stats = document.createElement("small"); stats.textContent = diffStats(change.diff || "").label;
+      header.append(badge, path, stats); details.append(header, diffBlock(change.diff || "暂无 Diff")); list.append(details);
+    }
+    if (!changes.length) { const waiting = document.createElement("p"); waiting.className = "timeline-muted"; waiting.textContent = "正在准备文件变更…"; list.append(waiting); }
+    body.append(list);
+  });
   return node;
 }
 
@@ -115,24 +118,27 @@ function planItem(item) {
   node.querySelector(".timeline-body").append(content); return node;
 }
 
-function mcpToolItem(item) {
+function mcpToolItem(item, { lazy = false } = {}) {
   const title = item.appContext?.displayName || item.tool || "MCP 工具";
   const node = baseCard({ kind: "tool", icon: "◇", title, subtitle: item.server || item.pluginId || "工具调用", status: item.status, open: item.status === "inProgress" });
-  const body = node.querySelector(".timeline-body");
-  body.append(section("参数", codeBlock(pretty(item.arguments))));
-  const progress = document.createElement("ul"); progress.className = "timeline-progress-list"; body.append(progress);
-  if (item.result) appendToolResult(body, item.result);
-  if (item.error?.message) body.append(errorBlock(item.error.message));
-  if (item.durationMs != null) body.append(metaRow([`耗时：${formatDuration(item.durationMs)}`]));
+  populateBody(node, lazy, (body) => {
+    body.append(section("参数", codeBlock(pretty(item.arguments))));
+    const progress = document.createElement("ul"); progress.className = "timeline-progress-list"; body.append(progress);
+    if (item.result) appendToolResult(body, item.result);
+    if (item.error?.message) body.append(errorBlock(item.error.message));
+    if (item.durationMs != null) body.append(metaRow([`耗时：${formatDuration(item.durationMs)}`]));
+  });
   return node;
 }
 
-function dynamicToolItem(item) {
+function dynamicToolItem(item, { lazy = false } = {}) {
   const title = [item.namespace, item.tool].filter(Boolean).join(".") || "客户端工具";
   const node = baseCard({ kind: "tool", icon: "◇", title, subtitle: "动态工具调用", status: item.status, open: item.status === "inProgress" });
-  const body = node.querySelector(".timeline-body"); body.append(section("参数", codeBlock(pretty(item.arguments))));
-  const progress = document.createElement("ul"); progress.className = "timeline-progress-list"; body.append(progress);
-  if (item.contentItems?.length) body.append(section("结果", codeBlock(item.contentItems.map((entry) => entry.text || entry.imageUrl || pretty(entry)).join("\n"))));
+  populateBody(node, lazy, (body) => {
+    body.append(section("参数", codeBlock(pretty(item.arguments))));
+    const progress = document.createElement("ul"); progress.className = "timeline-progress-list"; body.append(progress);
+    if (item.contentItems?.length) body.append(section("结果", codeBlock(item.contentItems.map((entry) => entry.text || entry.imageUrl || pretty(entry)).join("\n"))));
+  });
   return node;
 }
 
@@ -181,6 +187,14 @@ function baseCard({ kind, icon, title, subtitle, status, open }) {
   summary.append(mark, heading, badge);
   const body = document.createElement("div"); body.className = "timeline-body";
   node.append(summary, body); return node;
+}
+
+function populateBody(node, lazy, build) {
+  const body = node.querySelector(".timeline-body");
+  if (!lazy || node.open) { build(body); return; }
+  const hint = document.createElement("p"); hint.className = "timeline-muted timeline-lazy-hint"; hint.textContent = "展开后加载详细内容"; body.append(hint);
+  const load = () => { if (!node.open) return; node.removeEventListener("toggle", load); body.replaceChildren(); build(body); };
+  node.addEventListener("toggle", load);
 }
 
 function section(title, child) { const wrap = document.createElement("section"); const label = document.createElement("h4"); label.textContent = title; wrap.append(label, child); return wrap; }

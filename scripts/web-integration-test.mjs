@@ -9,6 +9,8 @@ const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-web-integration-"))
 const port = 18992;
 const base = `http://127.0.0.1:${port}`;
 const password = "integration-test-only";
+const desktopStateFile = path.join(temp, "desktop-state.json");
+await fsp.writeFile(desktopStateFile, JSON.stringify({ running: false, processes: [] }));
 let cookie = "";
 let secondaryCookie = "";
 let lastSetCookie = "";
@@ -25,6 +27,7 @@ const serverEnv = {
   CODEX_WEB_SESSION_HOURS: "24",
   CODEX_WEB_DATA_DIR: path.join(temp, "data"),
   CODEX_WEB_UPLOAD_DIR: path.join(temp, "uploads"),
+  CODEX_WEB_TEST_DESKTOP_STATE_FILE: desktopStateFile,
 };
 
 const request = async (url, options = {}) => {
@@ -78,9 +81,16 @@ try {
   }
   cookie = primaryCookie;
   const primaryControl = await request("/api/control/status");
-  if (!primaryControl.controller || primaryControl.controllerBusy || !primaryControl.sharedWebControl) {
+  if (!primaryControl.controller || primaryControl.controllerBusy || !primaryControl.sharedWebControl || Number(primaryControl.webClientCount) < 0) {
     throw new Error(`First Web session lost shared control: ${JSON.stringify(primaryControl)}`);
   }
+  const uploadResponse = await fetch(`${base}/api/uploads?name=${encodeURIComponent("upload-check.txt")}&type=text%2Fplain`, {
+    method: "POST", headers: { Cookie: cookie, Origin: base, "Content-Type": "application/octet-stream" }, body: Buffer.from("UPLOAD_ROUNDTRIP_OK"),
+  });
+  const uploaded = await uploadResponse.json();
+  if (!uploadResponse.ok || !uploaded.id || uploaded.size !== 19) throw new Error(`Upload endpoint did not persist attachment: ${JSON.stringify(uploaded)}`);
+  const deletedUpload = await request(`/api/uploads/${uploaded.id}`, { method: "DELETE", body: {} });
+  if (!deletedUpload.ok) throw new Error("Uploaded attachment could not be removed");
   const emptyDraft = await request("/api/threads", { method: "POST", body: { cwd: root } });
   await stopServer(child); child = null;
   child = await startServer();
@@ -104,6 +114,7 @@ try {
   try {
     const accountUsage = await request("/api/account/usage");
     if (!accountUsage.rateLimits?.rateLimits) throw new Error("Account rate limits were not returned");
+    if (!Array.isArray(accountUsage.history?.samples) || !Array.isArray(accountUsage.history?.observed)) throw new Error("Account token history was not returned");
   } catch (error) {
     // The quota endpoint is a separate ChatGPT backend and can be temporarily
     // unavailable while normal Codex turns still work. Keep the integration
@@ -172,6 +183,12 @@ try {
   if (!sawSettings) throw new Error("Official thread settings were not synchronized");
   if (!sawTokenUsage) throw new Error("Official token usage events were not emitted");
   if (!sawCommandStart || !sawCommandOutput) throw new Error("Command timeline events were incomplete");
+  const cachedSnapshot = await request(`/api/threads/${threadId}/snapshot`);
+  if (cachedSnapshot.thread?.id !== threadId || !Array.isArray(cachedSnapshot.thread?.turns) || !cachedSnapshot.cached) {
+    throw new Error(`Completed thread snapshot was not cached: ${JSON.stringify(cachedSnapshot)}`);
+  }
+  const resumedTogether = await Promise.all([request(`/api/threads/${threadId}`), request(`/api/threads/${threadId}`)]);
+  if (resumedTogether.some((entry) => entry.thread?.id !== threadId)) throw new Error("Concurrent thread activation did not return the same task");
   const synchronized = await request("/api/control/status");
   if (!synchronized.fullAccess) throw new Error("Full access was not enabled by default");
   if (!synchronized.turnPlans || !synchronized.turnDiffs || !Array.isArray(synchronized.pendingRequests)) throw new Error("Reconnect state snapshot is incomplete");
@@ -200,6 +217,11 @@ try {
   child = await startServer();
   const restoredSession = await request("/api/session");
   if (!restoredSession.authenticated) throw new Error("24-hour session did not survive a server restart");
+  await request("/api/control/takeover", { method: "POST", body: {} });
+  await fsp.writeFile(desktopStateFile, JSON.stringify({ running: true, processes: [{ pid: 4242, name: "ChatGPT.exe", main: true }] }));
+  await waitFor(async () => (await request("/api/session")).mode === "desktop", 15_000);
+  const controlAudit = await fsp.readFile(path.join(temp, "data", "control-audit.jsonl"), "utf8");
+  if (!controlAudit.includes('"action":"auto-yield-to-desktop"')) throw new Error("Idle Web control did not automatically yield to the desktop app");
   console.log(`WEB_INTEGRATION_OK reasoning_events=${sawReasoning} account_usage=${accountUsageVerified ? "verified" : "upstream_unavailable"}`);
   if (stderr.trim()) console.error(stderr.trim());
 } finally {
