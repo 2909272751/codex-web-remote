@@ -17,7 +17,7 @@ import {
 } from "./timeline.js";
 
 const $ = (id) => document.getElementById(id);
-const state = { threads: [], models: [], current: null, currentSettings: null, threadStatus: null, tokenUsage: null, pendingThreadId: null, socket: null, socketConnected: false, reconnectTimer: null, activeTurnId: null, activity: null, control: null, attachments: [], queue: [], reasoningStreams: new Map(), usage: null, resetAttemptId: null, usageRefreshTimer: null, pendingRequests: [], lastEventSeq: 0, syncing: false, eventBacklog: [], reconnectCount: 0, update: null, updateLoaded: false };
+const state = { threads: [], projects: [], selectedProjectId: null, projectsLoaded: false, directory: null, createAfterProject: false, models: [], current: null, currentSettings: null, threadStatus: null, tokenUsage: null, pendingThreadId: null, socket: null, socketConnected: false, reconnectTimer: null, activeTurnId: null, activity: null, control: null, attachments: [], queue: [], reasoningStreams: new Map(), usage: null, resetAttemptId: null, usageRefreshTimer: null, pendingRequests: [], lastEventSeq: 0, syncing: false, eventBacklog: [], reconnectCount: 0, update: null, updateLoaded: false };
 syncViewportHeight();
 window.addEventListener("resize", syncViewportHeight, { passive: true });
 window.addEventListener("orientationchange", syncViewportHeight, { passive: true });
@@ -48,7 +48,7 @@ $("menuBtn").addEventListener("click", () => $("sidebarBackdrop").classList.togg
 $("sidebarBackdrop").addEventListener("click", closeSidebar);
 $("sidebarCloseBtn").addEventListener("click", closeSidebar);
 $("mobileToolsBtn").addEventListener("click", toggleComposerTools);
-document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeSidebar(); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") { closeProjectModal(); closeSidebar(); } });
 document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.socketConnected) connectEvents(); });
 $("composer").addEventListener("submit", sendMessage);
 $("messageInput").addEventListener("input", autoSize);
@@ -62,6 +62,14 @@ $("takeoverBtn").addEventListener("click", takeover);
 $("fullAccessBtn").addEventListener("click", toggleFullAccess);
 $("permissionShortcut").addEventListener("click", toggleFullAccess);
 $("newThreadBtn").addEventListener("click", createThread);
+$("addProjectBtn").addEventListener("click", () => openProjectModal(false));
+$("projectCloseBtn").addEventListener("click", closeProjectModal);
+$("projectCancelBtn").addEventListener("click", closeProjectModal);
+$("projectModal").addEventListener("click", (event) => { if (event.target === $("projectModal")) closeProjectModal(); });
+$("projectForm").addEventListener("submit", saveProject);
+$("projectBrowseBtn").addEventListener("click", () => loadDirectory($("projectPath").value.trim()));
+$("directoryUpBtn").addEventListener("click", () => loadDirectory(state.directory?.parent || ""));
+$("directorySelectBtn").addEventListener("click", selectCurrentDirectory);
 $("modelSelect").addEventListener("change", () => { renderEfforts(); updateComposer(); });
 $("summarySelect").addEventListener("change", updateComposer);
 $("releaseBtn").addEventListener("click", releaseControl);
@@ -89,6 +97,7 @@ async function refreshControl() {
   state.control = await api("/api/control/status");
   state.pendingRequests = Array.isArray(state.control.pendingRequests) ? state.control.pendingRequests : [];
   renderControl();
+  await loadProjects().catch((error) => toast(`项目列表：${error.message}`));
   if (state.current?.id && state.control.activities?.[state.current.id]) setActivity(state.control.activities[state.current.id]);
   if (state.control.mode === "web" && state.control.controller) await loadThreads();
   else await loadThreadPreviews();
@@ -205,16 +214,131 @@ async function releaseControl() {
 
 async function loadThreads() { const result = await api("/api/threads"); state.threads = result.data || []; renderThreads(); }
 async function loadThreadPreviews() { const result = await api("/api/thread-previews"); state.threads = result.data || []; renderThreads(); }
+async function loadProjects(preferredId = null) {
+  const result = await api("/api/projects");
+  state.projects = Array.isArray(result.data) ? result.data : [];
+  if (!state.projectsLoaded || preferredId !== null) {
+    const remembered = preferredId ?? readProjectPreference();
+    const currentMatch = state.current?.cwd ? state.projects.find((project) => projectContainsPath(project.path, state.current.cwd)) : null;
+    state.selectedProjectId = remembered === "" || state.projects.some((project) => project.id === remembered) ? remembered : (currentMatch?.id || state.projects[0]?.id || "");
+    state.projectsLoaded = true;
+  } else if (state.selectedProjectId && !state.projects.some((project) => project.id === state.selectedProjectId)) {
+    state.selectedProjectId = state.projects[0]?.id || "";
+  }
+  writeProjectPreference(state.selectedProjectId);
+  renderProjects(); renderThreads();
+}
 async function loadModels() { const result = await api("/api/models"); state.models = result.data || []; renderModels(); }
 function renderModels() { const select = $("modelSelect"); const selected = select.value; const options = [new Option("默认模型", "")]; for (const model of state.models) options.push(new Option(model.displayName || model.name || model.model || model.id, model.model || model.id)); select.replaceChildren(...options); if ([...select.options].some((item) => item.value === selected)) select.value = selected; renderEfforts(); }
 function renderEfforts() { const model = state.models.find((item) => (item.model || item.id) === $("modelSelect").value); const values = model?.supportedReasoningEfforts || []; const selected = $("effortSelect").value; const labels = { none: "无思考", minimal: "极轻", low: "轻度", medium: "中等", high: "较深", xhigh: "深度", max: "最深", ultra: "Ultra" }; $("effortSelect").replaceChildren(new Option("默认强度", ""), ...values.map((item) => { const value = typeof item === "string" ? item : (item.reasoningEffort || item.effort || item.value); return new Option(labels[value] || value, value); })); if ([...$("effortSelect").options].some((item) => item.value === selected)) $("effortSelect").value = selected; }
 
-async function createThread() { if (state.control?.mode !== "web") return toast("请先接管 Codex"); const cwd = state.current?.cwd || state.threads.find((item) => item.cwd)?.cwd || ""; try { const result = await api("/api/threads", { method: "POST", body: { cwd, model: $("modelSelect").value, effort: $("effortSelect").value } }); await loadThreads(); await openThread(result.thread.id); $("messageInput").focus(); toast("新任务已创建"); } catch (error) { toast(error.message); } }
+async function createThread(cwdOverride = "") {
+  if (state.control?.mode !== "web") return toast("请先接管 Codex");
+  const project = state.projects.find((item) => item.id === state.selectedProjectId);
+  const cwd = typeof cwdOverride === "string" && cwdOverride ? cwdOverride : (project?.path || state.current?.cwd || "");
+  if (!cwd) { state.createAfterProject = true; openProjectModal(true); return toast("先添加或选择一个项目文件夹"); }
+  $("newThreadBtn").disabled = true;
+  try {
+    const result = await api("/api/threads", { method: "POST", body: { cwd, model: $("modelSelect").value, effort: $("effortSelect").value } });
+    await loadThreads();
+    if (result.thread?.id && !state.threads.some((thread) => thread.id === result.thread.id)) { state.threads.unshift(result.thread); renderThreads(); }
+    await openThread(result.thread.id); $("messageInput").focus(); toast(`已在 ${project?.name || folderName(cwd)} 中创建任务`);
+  } catch (error) { toast(error.message); }
+  finally { $("newThreadBtn").disabled = state.control?.mode !== "web"; }
+}
+
+function renderProjects() {
+  const nodes = [];
+  const all = document.createElement("button");
+  all.type = "button"; all.className = `project-all${state.selectedProjectId === "" ? " active" : ""}`; all.textContent = "所有项目";
+  all.addEventListener("click", () => selectProject("")); nodes.push(all);
+  for (const project of state.projects) {
+    const item = document.createElement("div"); item.className = `project-item${state.selectedProjectId === project.id ? " active" : ""}`;
+    const choose = document.createElement("button"); choose.type = "button"; choose.className = "project-choose"; choose.title = project.path;
+    const icon = document.createElement("span"); icon.textContent = "▱";
+    const copy = document.createElement("span"); const name = document.createElement("strong"); name.textContent = project.name; const projectPath = document.createElement("small"); projectPath.textContent = project.path; copy.append(name, projectPath); choose.append(icon, copy);
+    choose.addEventListener("click", () => selectProject(project.id));
+    const remove = document.createElement("button"); remove.type = "button"; remove.className = "project-remove"; remove.textContent = "×"; remove.title = "从列表移除"; remove.setAttribute("aria-label", `移除 ${project.name}`); remove.addEventListener("click", () => removeProject(project));
+    item.append(choose, remove); nodes.push(item);
+  }
+  $("projectList").replaceChildren(...nodes);
+}
+
+function selectProject(id) { state.selectedProjectId = id; writeProjectPreference(id); renderProjects(); renderThreads(); }
+
+async function removeProject(project) {
+  if (!confirm(`从 Web 项目列表移除“${project.name}”？电脑里的文件和对话记录不会删除。`)) return;
+  try { await api(`/api/projects/${encodeURIComponent(project.id)}`, { method: "DELETE" }); await loadProjects(state.selectedProjectId === project.id ? "" : state.selectedProjectId); toast("已从项目列表移除，文件未删除"); }
+  catch (error) { toast(error.message); }
+}
+
 function renderThreads() {
   const query = $("search").value.trim().toLowerCase();
-  const list = state.threads.filter((t) => (t.preview || t.id).toLowerCase().includes(query));
-  $("threadList").replaceChildren(...list.map((thread) => { const b = document.createElement("button"); b.className = `thread${(state.current?.id || state.pendingThreadId) === thread.id ? " active" : ""}`; const head = document.createElement("div"); head.className = "thread-head"; const title = document.createElement("strong"); title.textContent = thread.preview || "未命名任务"; head.append(title); if (state.control?.activeTurns?.[thread.id]) { const live = document.createElement("i"); live.className = "thread-live"; live.title = "正在运行"; head.append(live); } const queued = Number(state.control?.queuedByThread?.[thread.id] || 0); if (queued) { const badge = document.createElement("b"); badge.className = "thread-queue"; badge.textContent = queued; badge.title = `${queued} 条排队消息`; head.append(badge); } const meta = document.createElement("small"); meta.textContent = formatDate(thread.recencyAt || thread.updatedAt || thread.createdAt); b.append(head, meta); b.addEventListener("click", () => state.control?.mode === "web" ? openThread(thread.id) : previewThread(thread)); return b; }));
+  const project = state.projects.find((item) => item.id === state.selectedProjectId);
+  const list = state.threads.filter((thread) => (!project || projectContainsPath(project.path, thread.cwd)) && `${thread.preview || thread.id} ${thread.cwd || ""}`.toLowerCase().includes(query));
+  const nodes = list.map((thread) => { const b = document.createElement("button"); b.className = `thread${(state.current?.id || state.pendingThreadId) === thread.id ? " active" : ""}`; const head = document.createElement("div"); head.className = "thread-head"; const title = document.createElement("strong"); title.textContent = thread.preview || "未命名任务"; head.append(title); if (state.control?.activeTurns?.[thread.id]) { const live = document.createElement("i"); live.className = "thread-live"; live.title = "正在运行"; head.append(live); } const queued = Number(state.control?.queuedByThread?.[thread.id] || 0); if (queued) { const badge = document.createElement("b"); badge.className = "thread-queue"; badge.textContent = queued; badge.title = `${queued} 条排队消息`; head.append(badge); } const meta = document.createElement("small"); meta.textContent = formatDate(thread.recencyAt || thread.updatedAt || thread.createdAt); b.append(head, meta); b.addEventListener("click", () => state.control?.mode === "web" ? openThread(thread.id) : previewThread(thread)); return b; });
+  if (!nodes.length) { const empty = document.createElement("div"); empty.className = "thread-list-empty"; empty.textContent = project ? "这个项目还没有任务" : "暂无任务"; nodes.push(empty); }
+  $("threadList").replaceChildren(...nodes);
 }
+
+function openProjectModal(createAfter = false) {
+  state.createAfterProject = createAfter;
+  const selected = state.projects.find((item) => item.id === state.selectedProjectId);
+  $("projectName").value = "";
+  $("projectPath").value = selected?.path || state.current?.cwd || "";
+  $("projectError").textContent = "";
+  $("projectModal").classList.remove("hidden"); document.body.classList.add("modal-open");
+  loadDirectory($("projectPath").value.trim()).catch(() => {});
+  setTimeout(() => ($("projectPath").value ? $("projectName") : $("projectPath")).focus(), 0);
+}
+
+function hideProjectModal() { $("projectModal").classList.add("hidden"); document.body.classList.remove("modal-open"); }
+function closeProjectModal() { if ($("projectModal").classList.contains("hidden")) return; state.createAfterProject = false; hideProjectModal(); }
+
+async function saveProject(event) {
+  event.preventDefault();
+  const pathValue = $("projectPath").value.trim();
+  if (!pathValue) { $("projectError").textContent = "请选择或输入项目文件夹"; return; }
+  const button = $("projectSaveBtn"); button.disabled = true; button.textContent = "正在添加…"; $("projectError").textContent = "";
+  try {
+    const result = await api("/api/projects", { method: "POST", body: { path: pathValue, name: $("projectName").value.trim() } });
+    const createAfter = state.createAfterProject; state.createAfterProject = false; hideProjectModal();
+    await loadProjects(result.project.id); closeSidebar(); toast(`已添加项目：${result.project.name}`);
+    if (createAfter) await createThread(result.project.path);
+  } catch (error) { $("projectError").textContent = error.message; }
+  finally { button.disabled = false; button.textContent = "添加并使用"; }
+}
+
+async function loadDirectory(directoryPath = "") {
+  $("directoryBrowser").classList.remove("hidden");
+  $("directoryCurrent").textContent = "正在读取…"; $("directoryList").replaceChildren(); $("projectError").textContent = "";
+  try {
+    const query = directoryPath ? `?path=${encodeURIComponent(directoryPath)}` : "";
+    state.directory = await api(`/api/directories${query}`);
+    $("directoryCurrent").textContent = state.directory.current || "选择磁盘";
+    $("directoryUpBtn").disabled = !state.directory.current;
+    $("directorySelectBtn").disabled = !state.directory.current;
+    const nodes = state.directory.entries.map((entry) => {
+      const button = document.createElement("button"); button.type = "button"; button.className = "directory-entry"; button.title = entry.path;
+      const icon = document.createElement("span"); icon.textContent = state.directory.current ? "▱" : "▣";
+      const name = document.createElement("strong"); name.textContent = entry.name; button.append(icon, name); button.addEventListener("click", () => loadDirectory(entry.path)); return button;
+    });
+    if (!nodes.length) { const empty = document.createElement("p"); empty.className = "directory-empty"; empty.textContent = "这个目录没有子文件夹，可直接选择当前目录"; nodes.push(empty); }
+    $("directoryList").replaceChildren(...nodes);
+  } catch (error) { state.directory = null; $("directoryCurrent").textContent = "无法读取"; $("directoryUpBtn").disabled = true; $("directorySelectBtn").disabled = true; $("projectError").textContent = error.message; }
+}
+
+function selectCurrentDirectory() {
+  if (!state.directory?.current) return;
+  $("projectPath").value = state.directory.current;
+  if (!$("projectName").value) $("projectName").value = folderName(state.directory.current);
+}
+
+function normalizeClientPath(value) { return String(value || "").replaceAll("\\", "/").replace(/\/+$/, "").toLocaleLowerCase("en-US"); }
+function projectContainsPath(projectPath, candidatePath) { const project = normalizeClientPath(projectPath); const candidate = normalizeClientPath(candidatePath); return Boolean(project && candidate && (candidate === project || candidate.startsWith(`${project}/`))); }
+function folderName(value) { const parts = String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/); return parts.at(-1) || value; }
+function readProjectPreference() { try { const value = localStorage.getItem("codex-web-project-id"); return value === "__all__" ? "" : value; } catch { return null; } }
+function writeProjectPreference(value) { try { localStorage.setItem("codex-web-project-id", value || "__all__"); } catch { } }
 
 async function previewThread(thread) {
   state.pendingThreadId = thread.id;

@@ -12,8 +12,8 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/styles.css?v=1.3.0">
-  <link rel="stylesheet" href="/layout-fix.css?v=1.3.0">
+  <link rel="stylesheet" href="/styles.css?v=1.4.0">
+  <link rel="stylesheet" href="/layout-fix.css?v=1.4.0">
 </head>
 <body>
   <section id="loginView" class="center-card hidden">
@@ -30,6 +30,8 @@
     <aside id="sidebar" class="sidebar">
       <header><div class="brand-mark">C</div><strong>Codex <em>Remote</em></strong><span id="statusDot" class="dot"></span><button id="sidebarCloseBtn" class="sidebar-close" aria-label="关闭任务列表">×</button></header>
       <div class="sidebar-actions"><button id="newThreadBtn" class="nav-action"><span>＋</span> 新建任务</button></div>
+      <div class="section-label project-section-label"><span>项目</span><button id="addProjectBtn" type="button" title="添加项目文件夹" aria-label="添加项目文件夹">＋</button></div>
+      <nav id="projectList" class="project-list"></nav>
       <div class="toolbar"><span>⌕</span><input id="search" type="search" placeholder="搜索任务"></div>
       <div class="section-label">最近任务</div>
       <nav id="threadList" class="thread-list"></nav>
@@ -102,6 +104,19 @@
       </div>
     </section>
   </div>
-  <script type="module" src="/app.js?v=1.3.0"></script>
+  <div id="projectModal" class="modal-backdrop hidden" role="presentation">
+    <form id="projectForm" class="project-dialog" role="dialog" aria-modal="true" aria-labelledby="projectTitle">
+      <header><div><h2 id="projectTitle">添加项目</h2><p>选择这台电脑上已有的项目文件夹</p></div><button id="projectCloseBtn" type="button" aria-label="关闭">×</button></header>
+      <label class="project-field"><span>项目名称 <small>可选</small></span><input id="projectName" maxlength="80" autocomplete="off" placeholder="自动使用文件夹名称"></label>
+      <label class="project-field"><span>文件夹路径</span><div class="project-path-row"><input id="projectPath" required autocomplete="off" spellcheck="false" placeholder="例如 D:\\我的项目"><button id="projectBrowseBtn" type="button">浏览</button></div></label>
+      <section id="directoryBrowser" class="directory-browser hidden">
+        <header><button id="directoryUpBtn" type="button">← 上一级</button><strong id="directoryCurrent">选择磁盘</strong><button id="directorySelectBtn" type="button">选择当前目录</button></header>
+        <div id="directoryList" class="directory-list"></div>
+      </section>
+      <p id="projectError" class="project-error"></p>
+      <footer><button id="projectCancelBtn" type="button">取消</button><button id="projectSaveBtn" type="submit">添加并使用</button></footer>
+    </form>
+  </div>
+  <script type="module" src="/app.js?v=1.4.0"></script>
 </body>
 </html>

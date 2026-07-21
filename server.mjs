@@ -23,6 +23,7 @@ const dataDir = process.env.CODEX_WEB_DATA_DIR ? path.resolve(process.env.CODEX_
 const queueFile = path.join(dataDir, "queues.json");
 const threadCacheFile = path.join(dataDir, "threads.json");
 const sessionFile = path.join(dataDir, "sessions.json");
+const projectFile = path.join(dataDir, "projects.json");
 const updateRequestFile = process.env.CODEX_WEB_UPDATE_REQUEST_FILE ? path.resolve(process.env.CODEX_WEB_UPDATE_REQUEST_FILE) : "";
 const updateApiUrl = process.env.CODEX_WEB_UPDATE_API || "https://api.github.com/repos/2909272751/codex-web-remote/releases/latest";
 const currentVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0";
@@ -52,6 +53,7 @@ const attempts = new Map();
 const sockets = new Set();
 const uploads = new Map();
 const queues = await loadJson(queueFile, {});
+let projectStore = normalizeProjectStore(await loadJson(projectFile, { projects: [], hiddenPaths: [] }));
 const activeTurns = new Map();
 const threadActivities = new Map();
 const threadStatuses = new Map();
@@ -235,6 +237,69 @@ app.post("/api/update/apply", requireAuth, requireController, requireSameOrigin,
   res.status(202).json({ ok: true, version: release.latestVersion, message: "主机正在下载更新，服务稍后会自动重启" });
 }));
 
+app.get("/api/projects", requireAuth, asyncRoute(async (req, res) => {
+  res.json({ data: await projectCatalog() });
+}));
+
+app.post("/api/projects", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
+  const requestedPath = String(req.body?.path || "").trim();
+  if (!requestedPath || !path.isAbsolute(requestedPath)) return res.status(400).json({ error: "请输入这台电脑上的完整文件夹路径" });
+  const target = normalizeProjectPath(requestedPath);
+  let stat;
+  try { stat = await fsp.stat(target); } catch { return res.status(404).json({ error: "找不到这个文件夹，请检查路径" }); }
+  if (!stat.isDirectory()) return res.status(400).json({ error: "所选路径不是文件夹" });
+
+  const key = projectPathKey(target);
+  const requestedName = String(req.body?.name || "").trim().slice(0, 80);
+  let project = projectStore.projects.find((item) => projectPathKey(item.path) === key);
+  if (project) {
+    if (requestedName) project.name = requestedName;
+    project.updatedAt = Date.now();
+  } else {
+    project = { id: crypto.randomUUID(), name: requestedName || projectDisplayName(target), path: target, createdAt: Date.now(), updatedAt: Date.now() };
+    projectStore.projects.unshift(project);
+  }
+  projectStore.hiddenPaths = projectStore.hiddenPaths.filter((item) => item !== key);
+  await saveProjects();
+  res.json({ project: { ...project, saved: true } });
+}));
+
+app.delete("/api/projects/:id", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
+  const catalog = await projectCatalog();
+  const project = catalog.find((item) => item.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "找不到这个项目" });
+  const key = projectPathKey(project.path);
+  projectStore.projects = projectStore.projects.filter((item) => projectPathKey(item.path) !== key);
+  if (!projectStore.hiddenPaths.includes(key)) projectStore.hiddenPaths.push(key);
+  await saveProjects();
+  res.json({ ok: true });
+}));
+
+app.get("/api/directories", requireAuth, asyncRoute(async (req, res) => {
+  const requestedPath = typeof req.query.path === "string" ? req.query.path.trim() : "";
+  if (!requestedPath) {
+    const roots = process.platform === "win32"
+      ? "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((letter) => `${letter}:\\`).filter((drive) => fs.existsSync(drive))
+      : [path.parse(root).root];
+    return res.json({ current: "", parent: null, entries: roots.map((item) => ({ name: item, path: item })) });
+  }
+  if (!path.isAbsolute(requestedPath)) return res.status(400).json({ error: "目录路径必须是完整路径" });
+  const target = normalizeProjectPath(requestedPath);
+  let stat;
+  try { stat = await fsp.stat(target); } catch { return res.status(404).json({ error: "找不到这个目录" }); }
+  if (!stat.isDirectory()) return res.status(400).json({ error: "所选路径不是目录" });
+  let entries;
+  try {
+    entries = (await fsp.readdir(target, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .sort((left, right) => left.name.localeCompare(right.name, "zh-CN", { numeric: true }))
+      .slice(0, 300)
+      .map((entry) => ({ name: entry.name, path: path.join(target, entry.name) }));
+  } catch { return res.status(403).json({ error: "没有权限读取这个目录" }); }
+  const parent = path.dirname(target) === target ? "" : path.dirname(target);
+  res.json({ current: target, parent, entries });
+}));
+
 app.get("/api/threads", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
   const result = await codex.request("thread/list", {
     limit: Math.min(100, Math.max(1, Number(req.query.limit || 50))), sortKey: "recency_at", sortDirection: "desc",
@@ -245,7 +310,12 @@ app.get("/api/threads", requireAuth, requireWebMode, asyncRoute(async (req, res)
 }));
 
 app.post("/api/threads", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
-  const cwd = path.resolve(String(req.body?.cwd || root));
+  const requestedPath = String(req.body?.cwd || "").trim();
+  if (!requestedPath || !path.isAbsolute(requestedPath)) return res.status(400).json({ error: "请先选择一个项目文件夹" });
+  const cwd = normalizeProjectPath(requestedPath);
+  let stat;
+  try { stat = await fsp.stat(cwd); } catch { return res.status(404).json({ error: "项目文件夹不存在，请重新添加" }); }
+  if (!stat.isDirectory()) return res.status(400).json({ error: "项目路径不是文件夹" });
   const params = { cwd, ...(testMode ? { ephemeral: true } : {}), ...threadStartOverrides(req.body), ...threadPermissionOverrides() };
   const result = await codex.request("thread/start", params);
   if (result.thread?.id) { lastThreadId = result.thread.id; await mergeThreadCache(result.thread); }
@@ -658,6 +728,66 @@ async function findSessionFile(threadId) {
 function normalizeThread(thread) {
   return { id: thread.id, preview: thread.preview || thread.thread_name || "未命名任务", cwd: thread.cwd || "", recencyAt: thread.recencyAt, updatedAt: thread.updatedAt || thread.updated_at, createdAt: thread.createdAt };
 }
+
+function normalizeProjectStore(value) {
+  const source = Array.isArray(value) ? { projects: value, hiddenPaths: [] } : (value || {});
+  const projects = [];
+  const seen = new Set();
+  for (const item of Array.isArray(source.projects) ? source.projects : []) {
+    if (!item?.path || !path.isAbsolute(String(item.path))) continue;
+    const projectPath = normalizeProjectPath(item.path);
+    const key = projectPathKey(projectPath);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    projects.push({
+      id: String(item.id || crypto.randomUUID()),
+      name: String(item.name || projectDisplayName(projectPath)).slice(0, 80),
+      path: projectPath,
+      createdAt: Number(item.createdAt || Date.now()),
+      updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
+    });
+  }
+  return { projects, hiddenPaths: [...new Set((Array.isArray(source.hiddenPaths) ? source.hiddenPaths : []).map((item) => String(item)))].slice(0, 500) };
+}
+
+function normalizeProjectPath(value) {
+  const resolved = path.resolve(String(value || ""));
+  const rootPath = path.parse(resolved).root;
+  return resolved === rootPath ? rootPath : resolved.replace(/[\\/]+$/, "");
+}
+
+function projectPathKey(value) {
+  const normalized = normalizeProjectPath(value).replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized;
+}
+
+function projectDisplayName(value) {
+  const normalized = normalizeProjectPath(value);
+  return path.basename(normalized) || normalized;
+}
+
+async function projectCatalog() {
+  const byPath = new Map();
+  for (const project of projectStore.projects) byPath.set(projectPathKey(project.path), { ...project, saved: true });
+  const hidden = new Set(projectStore.hiddenPaths);
+  for (const thread of await readThreadPreviews()) {
+    if (!thread?.cwd || !path.isAbsolute(String(thread.cwd))) continue;
+    const projectPath = normalizeProjectPath(thread.cwd);
+    const key = projectPathKey(projectPath);
+    if (hidden.has(key) || byPath.has(key)) continue;
+    byPath.set(key, {
+      id: `history-${crypto.createHash("sha256").update(key).digest("hex").slice(0, 16)}`,
+      name: projectDisplayName(projectPath),
+      path: projectPath,
+      createdAt: 0,
+      updatedAt: Number(threadTime(thread) || 0),
+      saved: false,
+    });
+  }
+  return [...byPath.values()].sort((left, right) => Number(right.saved) - Number(left.saved) || right.updatedAt - left.updatedAt || left.name.localeCompare(right.name, "zh-CN"));
+}
+
+async function saveProjects() { await atomicJson(projectFile, projectStore); }
 
 function threadTime(thread) {
   const value = thread.recencyAt || thread.updatedAt || thread.createdAt || 0;
