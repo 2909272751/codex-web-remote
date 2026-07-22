@@ -32,6 +32,7 @@ const accountUsageSnapshotFile = path.join(dataDir, "account-usage-snapshot.json
 const updateRequestFile = process.env.CODEX_WEB_UPDATE_REQUEST_FILE ? path.resolve(process.env.CODEX_WEB_UPDATE_REQUEST_FILE) : "";
 const launcherPath = process.env.CODEX_WEB_LAUNCHER_PATH ? path.resolve(process.env.CODEX_WEB_LAUNCHER_PATH) : "";
 const updateApiUrl = process.env.CODEX_WEB_UPDATE_API || "https://api.github.com/repos/2909272751/codex-web-remote/releases/latest";
+const updatePageUrl = process.env.CODEX_WEB_UPDATE_PAGE || "https://github.com/2909272751/codex-web-remote/releases/latest";
 const currentVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0";
 const sessionIndexFile = path.join(process.env.USERPROFILE || root, ".codex", "session_index.jsonl");
 const sessionRoot = process.env.CODEX_WEB_SESSION_ROOT ? path.resolve(process.env.CODEX_WEB_SESSION_ROOT) : path.join(process.env.USERPROFILE || root, ".codex", "sessions");
@@ -270,7 +271,8 @@ app.post("/api/control/full-access", requireAuth, requireController, requireSame
 app.get("/api/status", requireAuth, (req, res) => res.json({ ready: codex.ready, mode, stderr: codex.stderrTail.slice(-10) }));
 
 app.get("/api/update/status", requireAuth, asyncRoute(async (req, res) => {
-  const release = await latestRelease(false);
+  const force = String(req.query?.force || "") === "1";
+  const release = await latestRelease(force);
   res.json({ currentVersion, ...release, updaterAvailable: Boolean(updateRequestFile) });
 }));
 
@@ -1842,7 +1844,10 @@ async function latestRelease(force = false) {
     headers: { Accept: "application/vnd.github+json", "User-Agent": `CodexWebRemote/${currentVersion}` },
     signal: AbortSignal.timeout(12_000),
   });
-  if (!response.ok) throw new Error(`GitHub 更新检查失败：HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 403 || response.status === 429) return cacheLatestRelease(await latestReleaseFromPublicPage());
+    throw new Error(`GitHub 更新检查失败：HTTP ${response.status}`);
+  }
   const data = await response.json();
   const latestVersion = String(data.tag_name || "").replace(/^v/i, "");
   const assets = Array.isArray(data.assets) ? data.assets : [];
@@ -1854,6 +1859,30 @@ async function latestRelease(force = false) {
     publishedAt: data.published_at || null,
     updateAvailable: !data.draft && !data.prerelease && hasSetup && hasHash && compareVersions(latestVersion, currentVersion) > 0,
   };
+  return cacheLatestRelease(value);
+}
+
+async function latestReleaseFromPublicPage() {
+  const response = await fetch(updatePageUrl, { redirect: "follow", signal: AbortSignal.timeout(12_000) });
+  if (!response.ok) throw new Error(`GitHub 更新检查失败：HTTP ${response.status}`);
+  const releaseUrl = String(response.url || updatePageUrl);
+  const match = releaseUrl.match(/\/releases\/tag\/v?([^/?#]+)/i);
+  const latestVersion = match ? decodeURIComponent(match[1]) : "";
+  if (!isReleaseVersion(latestVersion)) throw new Error("GitHub 更新检查失败：无法识别最新发布版本");
+  return {
+    latestVersion,
+    releaseUrl,
+    publishedAt: null,
+    updateAvailable: compareVersions(latestVersion, currentVersion) > 0,
+    fallback: "public-release-page",
+  };
+}
+
+function isReleaseVersion(value) {
+  return /^\d+(?:\.\d+){1,3}(?:[-+].*)?$/i.test(String(value || ""));
+}
+
+function cacheLatestRelease(value) {
   updateCache = { checkedAt: Date.now(), value };
   return value;
 }

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -11,6 +12,7 @@ internal sealed record PreparedUpdate(string SetupPath, string HelperPath, Relea
 internal sealed class UpdateService : IDisposable
 {
     private const string LatestReleaseApi = "https://api.github.com/repos/2909272751/codex-web-remote/releases/latest";
+    private const string LatestReleasePage = "https://github.com/2909272751/codex-web-remote/releases/latest";
     private readonly AppPaths _paths;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(20) };
 
@@ -27,6 +29,8 @@ internal sealed class UpdateService : IDisposable
     {
         var api = Environment.GetEnvironmentVariable("CODEX_WEB_UPDATE_API") ?? LatestReleaseApi;
         using var response = await _http.GetAsync(api, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (response.StatusCode is HttpStatusCode.Forbidden or (HttpStatusCode)429)
+            return await CheckFromPublicReleasePageAsync(cancellationToken);
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
@@ -45,6 +49,21 @@ internal sealed class UpdateService : IDisposable
             if (name.EndsWith("-win-x64.exe.sha256", StringComparison.OrdinalIgnoreCase) && name.Contains("Setup", StringComparison.OrdinalIgnoreCase)) hash = url;
         }
         return string.IsNullOrWhiteSpace(setup) || string.IsNullOrWhiteSpace(hash) ? null : new ReleaseInfo(tag, version, page, setup, hash);
+    }
+
+    private async Task<ReleaseInfo?> CheckFromPublicReleasePageAsync(CancellationToken cancellationToken)
+    {
+        var pageUrl = Environment.GetEnvironmentVariable("CODEX_WEB_UPDATE_PAGE") ?? LatestReleasePage;
+        using var response = await _http.GetAsync(pageUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        var page = response.RequestMessage?.RequestUri?.ToString() ?? pageUrl;
+        var tag = page.Split("/releases/tag/", StringSplitOptions.None).LastOrDefault()?.Split('?', '#')[0] ?? "";
+        if (!TryParseVersion(tag, out var version)) return null;
+        var normalizedTag = tag.Trim();
+        var baseUrl = $"https://github.com/2909272751/codex-web-remote/releases/download/{normalizedTag}";
+        var setup = $"{baseUrl}/CodexWebRemote-Setup-{version}-win-x64.exe";
+        var hash = $"{setup}.sha256";
+        return new ReleaseInfo(normalizedTag, version, page, setup, hash);
     }
 
     public bool IsNewer(ReleaseInfo release) => release.Version > CurrentVersion;

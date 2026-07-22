@@ -6,7 +6,13 @@ import path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "..");
 const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-web-update-test-"));
+let releaseRequests = 0;
+let rateLimitMode = false;
 const releaseServer = http.createServer((request, response) => {
+  releaseRequests += 1;
+  if (request.url === "/latest" && rateLimitMode) { response.writeHead(403); response.end("rate limited"); return; }
+  if (request.url === "/releases/latest") { response.writeHead(302, { Location: "/releases/tag/v99.0.0" }); response.end(); return; }
+  if (request.url === "/releases/tag/v99.0.0") { response.writeHead(200, { "Content-Type": "text/html" }); response.end("latest"); return; }
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify({
     tag_name: "v99.0.0",
@@ -36,6 +42,7 @@ const child = spawn(process.execPath, ["server.mjs"], {
     CODEX_WEB_UPLOAD_DIR: path.join(temp, "uploads"),
     CODEX_WEB_UPDATE_REQUEST_FILE: path.join(temp, "update-request.json"),
     CODEX_WEB_UPDATE_API: `http://127.0.0.1:${releasePort}/latest`,
+    CODEX_WEB_UPDATE_PAGE: `http://127.0.0.1:${releasePort}/releases/latest`,
   },
 });
 let stderr = "";
@@ -56,6 +63,10 @@ try {
   const response = await fetch(`http://127.0.0.1:${gatewayPort}/api/update/status`, { headers: { Cookie: cookie } });
   const status = await response.json();
   if (!response.ok || !status.currentVersion || !status.updateAvailable || status.latestVersion !== "99.0.0" || !status.updaterAvailable) throw new Error(`Unexpected update status: ${JSON.stringify(status)}`);
+  rateLimitMode = true;
+  const forced = await fetch(`http://127.0.0.1:${gatewayPort}/api/update/status?force=1`, { headers: { Cookie: cookie } });
+  const fallback = await forced.json();
+  if (!forced.ok || !fallback.updateAvailable || fallback.fallback !== "public-release-page" || releaseRequests < 3) throw new Error("Rate-limited update check did not use the public release-page fallback");
   console.log("UPDATE_CHECK_TEST_OK detected=true updater=true");
 } finally {
   child.kill();

@@ -36,7 +36,7 @@
 ### 正式安装版（推荐）
 
 1. 打开 [GitHub Releases](https://github.com/2909272751/codex-web-remote/releases)。
-2. 下载 `CodexWebRemote-Setup-1.4.8-win-x64.exe`。
+2. 下载 `CodexWebRemote-Setup-1.4.9-win-x64.exe`。
 3. 双击安装程序，按提示完成安装。
 4. 安装结束后会自动打开“Codex Web Remote”首次设置窗口。
 5. 输入至少 8 位的 Web 密码，可选填 88frp 公网地址。
@@ -47,7 +47,7 @@
 
 ### 免安装版
 
-1. 下载 `CodexWebRemote-Portable-1.4.8-win-x64.zip`。
+1. 下载 `CodexWebRemote-Portable-1.4.9-win-x64.zip`。
 2. 完整解压到固定目录。
 3. 双击 `CodexWebRemote.exe`。
 4. 完成首次设置。
@@ -107,13 +107,13 @@ PWA 安装通常需要 HTTPS 公网入口；普通网页访问不要求安装 PW
 pnpm install --frozen-lockfile
 npm run check
 dotnet build .\desktop\CodexWebRemote.Launcher\CodexWebRemote.Launcher.csproj -c Release
-.\build-installer.ps1 -Version 1.4.8
+.\build-installer.ps1 -Version 1.4.9
 ```
 
 安装器回归测试：
 
 ```powershell
-.\scripts\installer-test.ps1 -SetupPath .\dist\CodexWebRemote-Setup-1.4.8-win-x64.exe
+.\scripts\installer-test.ps1 -SetupPath .\dist\CodexWebRemote-Setup-1.4.9-win-x64.exe
 ```
 
 ## 已知限制

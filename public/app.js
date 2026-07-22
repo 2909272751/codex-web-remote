@@ -68,6 +68,7 @@ $("loginForm").addEventListener("submit", async (event) => { event.preventDefaul
 $("logoutBtn").addEventListener("click", async () => { await api("/api/logout", { method: "POST" }); location.reload(); });
 $("accountMenuBtn").addEventListener("click", (event) => { event.stopPropagation(); toggleAccountMenu(); });
 $("usageMenuBtn").addEventListener("click", openUsage);
+$("updateCheckBtn").addEventListener("click", checkForUpdates);
 $("switchAccountMenuBtn").addEventListener("click", switchAccount);
 $("themeMenuBtn").addEventListener("click", toggleTheme);
 $("usageCloseBtn").addEventListener("click", closeUsage);
@@ -178,10 +179,10 @@ function scheduleControlRefresh(reloadResources = false) {
   }, 80);
 }
 
-async function loadUpdateStatus() {
+async function loadUpdateStatus({ force = false } = {}) {
   state.updateLoaded = true;
   try {
-    state.update = await api("/api/update/status");
+    state.update = await api(`/api/update/status${force ? "?force=1" : ""}`);
     setWebVersion(state.update.currentVersion);
     const available = Boolean(state.update.updateAvailable);
     $("updateBanner").classList.toggle("hidden", !available);
@@ -462,6 +463,22 @@ async function previewThread(thread) {
   } catch (error) {
     if (cachedView?.result?.thread) { $("chatMeta").textContent = `${cachedView.result.thread.cwd || thread.id} ? \u5df2\u663e\u793a\u7f13\u5b58\uff0c\u5237\u65b0\u5931\u8d25`; toast(error.message); return; }
     $("messages").replaceChildren(emptyNode(error.message)); toast(error.message);
+  }
+}
+
+async function checkForUpdates() {
+  const button = $("updateCheckBtn");
+  button.disabled = true;
+  button.textContent = "正在检查…";
+  try {
+    await loadUpdateStatus({ force: true });
+    if (state.update?.updateAvailable) toast(`发现新版本 v${state.update.latestVersion}`);
+    else toast(`当前已是最新版 v${state.update?.currentVersion || "--"}`);
+  } catch (error) {
+    toast(error.message || "检查更新失败");
+  } finally {
+    button.disabled = false;
+    button.innerHTML = "<span>↻</span> 检查更新";
   }
 }
 async function prefetchThreadSnapshot(thread) {
