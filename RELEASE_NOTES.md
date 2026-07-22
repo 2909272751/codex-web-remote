@@ -1,4 +1,15 @@
-﻿# Codex Web Remote v1.4.6
+﻿# Codex Web Remote v1.4.7
+
+## Public upload reliability
+
+- Fixed file uploads through HTTP 88frp addresses in Edge on both desktop and mobile. The Web UI now has a safe client-ID fallback when browsers do not expose `crypto.randomUUID()` outside a secure context.
+- Attachments can be prepared while a task snapshot is still synchronizing, instead of leaving the attach button disabled during background refresh.
+- Refreshed the PWA/cache asset version so updated upload behavior reaches existing browsers reliably.
+- Revalidated public-address upload with real Edge desktop and mobile viewports, including file picker, upload response and attachment-ready state.
+
+---
+
+# Codex Web Remote v1.4.6
 
 ## Web remote parity and setup polish
 

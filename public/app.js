@@ -22,6 +22,7 @@ const HISTORY_DOM_LIMIT = 240;
 const THREAD_VIEW_LIMIT = 8;
 const REMEMBER_PASSWORD_KEY = "codex-web-remember-password";
 const inflightLoads = new Map();
+const prefetchThreads = new Set();
 const uploadTransfers = new Map();
 let draftTimer = 0;
 const state = { threads: [], projects: [], selectedProjectId: null, projectsLoaded: false, directory: null, createAfterProject: false, models: [], current: null, currentSettings: null, threadStatus: null, tokenUsage: null, pendingThreadId: null, threadViews: new Map(), threadOpenController: null, threadSyncing: false, socket: null, socketConnected: false, socketEverConnected: false, reconnectTimer: null, reconnectStableTimer: null, activeTurnId: null, activity: null, control: null, attachments: [], queue: [], reasoningStreams: new Map(), itemNodes: new Map(), historyItems: [], historyVisibleStart: 0, historyVisibleEnd: 0, streamActions: [], reasoningDirty: new Set(), streamFrame: 0, scrollFrame: 0, followTail: true, viewportFrame: 0, controlRefreshTimer: 0, controlRefreshResources: false, usage: null, resetAttemptId: null, usageRefreshTimer: null, pendingRequests: [], lastEventSeq: 0, syncing: false, eventBacklog: [], reconnectCount: 0, update: null, updateLoaded: false };
@@ -88,6 +89,8 @@ $("composer").addEventListener("submit", sendMessage);
 $("messageInput").addEventListener("input", handleComposerInput);
 $("messageInput").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); $("composer").requestSubmit(); } });
 $("messageInput").addEventListener("paste", handlePaste);
+$("messageInput").addEventListener("focus", () => setComposerKeyboardActive(true));
+$("messageInput").addEventListener("blur", () => setComposerKeyboardActive(false));
 $("composer").addEventListener("dragover", (event) => { event.preventDefault(); });
 $("composer").addEventListener("drop", (event) => { event.preventDefault(); addFiles(event.dataTransfer.files); });
 $("attachBtn").addEventListener("click", () => $("fileInput").click());
@@ -139,6 +142,11 @@ function syncViewportHeight() {
   document.documentElement.style.setProperty("--app-height", `${Math.round(appHeight)}px`);
 }
 function scheduleViewportSync() { if (state.viewportFrame) return; state.viewportFrame = requestAnimationFrame(() => { state.viewportFrame = 0; syncViewportHeight(); }); }
+function setComposerKeyboardActive(active) {
+  document.documentElement.classList.toggle("keyboard-active", Boolean(active));
+  scheduleViewportSync();
+  if (active) setTimeout(() => { scrollBottom(); $("messageInput")?.scrollIntoView({ block: "nearest" }); }, 80);
+}
 function closeSidebar() { $("sidebar").classList.remove("open"); $("sidebarBackdrop").classList.remove("open"); }
 function toggleComposerTools() { const open = $("composerSettings").classList.toggle("open"); document.querySelector(".chat-shell")?.classList.toggle("tools-open", open); }
 function toggleAccountMenu() { const open = $("accountMenu").classList.toggle("hidden") === false; $("accountMenuBtn").setAttribute("aria-expanded", String(open)); }
@@ -225,7 +233,8 @@ function renderControl() {
   const labels = { desktop: "桌面 App 正在使用；接管后会正常关闭桌面 App", available: "桌面 App 未运行，可以接管", web: "Web 共享控制已开启，可在多个设备同时使用" };
   $("controlText").textContent = c.transition ? (c.takeoverState?.message || "正在切换…") : (c.takeoverState?.phase === "failed" ? `接管失败：${c.takeoverState.message}` : (labels[c.mode] || c.mode));
   const canControl = c.mode === "web" && c.controller;
-  for (const id of ["messageInput", "sendMode", "attachBtn"]) $(id).disabled = !canControl || !state.current;
+  for (const id of ["messageInput", "sendMode"]) $(id).disabled = !canControl || !state.current;
+  $("attachBtn").disabled = !state.current;
   $("sendBtn").disabled = !canControl || !state.current;
   $("permissionShortcut").disabled = !canControl;
   $("newThreadBtn").disabled = !canControl;
@@ -346,7 +355,7 @@ function renderThreads() {
   const query = $("search").value.trim().toLowerCase();
   const project = state.projects.find((item) => item.id === state.selectedProjectId);
   const list = state.threads.filter((thread) => (!project || projectContainsPath(project.path, thread.cwd)) && `${thread.preview || thread.id} ${thread.cwd || ""}`.toLowerCase().includes(query));
-  const nodes = list.map((thread) => { const b = document.createElement("button"); b.className = `thread${(state.current?.id || state.pendingThreadId) === thread.id ? " active" : ""}`; const head = document.createElement("div"); head.className = "thread-head"; const title = document.createElement("strong"); title.textContent = thread.preview || "未命名任务"; head.append(title); if (state.control?.activeTurns?.[thread.id]) { const live = document.createElement("i"); live.className = "thread-live"; live.title = "正在运行"; head.append(live); } const queued = Number(state.control?.queuedByThread?.[thread.id] || 0); if (queued) { const badge = document.createElement("b"); badge.className = "thread-queue"; badge.textContent = queued; badge.title = `${queued} 条排队消息`; head.append(badge); } const meta = document.createElement("small"); meta.textContent = formatDate(thread.recencyAt || thread.updatedAt || thread.createdAt); b.append(head, meta); b.addEventListener("click", () => state.control?.mode === "web" ? openThread(thread.id) : previewThread(thread)); return b; });
+  const nodes = list.map((thread) => { const b = document.createElement("button"); b.className = `thread${(state.current?.id || state.pendingThreadId) === thread.id ? " active" : ""}`; const head = document.createElement("div"); head.className = "thread-head"; const title = document.createElement("strong"); title.textContent = thread.preview || "未命名任务"; head.append(title); if (state.control?.activeTurns?.[thread.id]) { const live = document.createElement("i"); live.className = "thread-live"; live.title = "正在运行"; head.append(live); } const queued = Number(state.control?.queuedByThread?.[thread.id] || 0); if (queued) { const badge = document.createElement("b"); badge.className = "thread-queue"; badge.textContent = queued; badge.title = `${queued} 条排队消息`; head.append(badge); } const meta = document.createElement("small"); meta.textContent = formatDate(thread.recencyAt || thread.updatedAt || thread.createdAt); b.append(head, meta); b.addEventListener("pointerenter", () => prefetchThreadSnapshot(thread)); b.addEventListener("touchstart", () => prefetchThreadSnapshot(thread), { passive: true }); b.addEventListener("focus", () => prefetchThreadSnapshot(thread)); b.addEventListener("click", () => state.control?.mode === "web" ? openThread(thread.id) : previewThread(thread)); return b; });
   if (!nodes.length) { const empty = document.createElement("div"); empty.className = "thread-list-empty"; empty.textContent = project ? "这个项目还没有任务" : "暂无任务"; nodes.push(empty); }
   $("threadList").replaceChildren(...nodes);
 }
@@ -425,9 +434,15 @@ async function restoreLastThread() {
 async function previewThread(thread) {
   saveDraft();
   state.pendingThreadId = thread.id;
-  $("chatTitle").textContent = thread.preview || "Codex 任务"; $("chatMeta").textContent = "正在读取本机记录…";
-  $("messages").replaceChildren(emptyNode("正在加载对话历史…"));
+  $("chatTitle").textContent = thread.preview || "Codex \u4efb\u52a1"; $("chatMeta").textContent = "\u6b63\u5728\u8bfb\u53d6\u672c\u673a\u8bb0\u5f55\u2026";
+  $("messages").replaceChildren(emptyNode("\u6b63\u5728\u52a0\u8f7d\u5bf9\u8bdd\u5386\u53f2\u2026"));
   renderThreads(); closeSidebar(); updateComposer();
+  const cachedView = readThreadView(thread.id);
+  if (cachedView?.result?.thread) {
+    applyThreadResult(cachedView.result, thread.id, { syncing: true, restoreScroll: cachedView.scrollTop });
+    state.pendingThreadId = thread.id;
+    $("chatMeta").textContent = `${cachedView.result.thread.cwd || thread.id} ? \u5df2\u663e\u793a\u7f13\u5b58\uff0c\u6b63\u5728\u5237\u65b0`;
+  }
   try {
     let result;
     try {
@@ -438,9 +453,23 @@ async function previewThread(thread) {
     }
     if (state.pendingThreadId !== thread.id) return;
     state.current = result.thread;
-    $("chatMeta").textContent = `${result.thread.cwd || thread.id} · 只读`;
+    rememberThreadView(thread.id, result, $("messages").scrollTop);
+    $("chatMeta").textContent = `${result.thread.cwd || thread.id} ? \u53ea\u8bfb`;
     renderHistory(result.thread.turns || []); restoreDraft(result.thread.id); renderThreads(); updateComposer();
-  } catch (error) { $("messages").replaceChildren(emptyNode(error.message)); toast(error.message); }
+  } catch (error) {
+    if (cachedView?.result?.thread) { $("chatMeta").textContent = `${cachedView.result.thread.cwd || thread.id} ? \u5df2\u663e\u793a\u7f13\u5b58\uff0c\u5237\u65b0\u5931\u8d25`; toast(error.message); return; }
+    $("messages").replaceChildren(emptyNode(error.message)); toast(error.message);
+  }
+}
+async function prefetchThreadSnapshot(thread) {
+  const id = thread?.id;
+  if (!id || state.threadViews.has(id) || prefetchThreads.has(id)) return;
+  prefetchThreads.add(id);
+  try {
+    const result = await api(`/api/threads/${encodeURIComponent(id)}/snapshot`);
+    if (result?.thread?.id) rememberThreadView(id, result, 0);
+  } catch { }
+  finally { prefetchThreads.delete(id); }
 }
 
 async function openThread(id) {
@@ -620,6 +649,7 @@ function upsertTurnCard(type, payload) {
 }
 function upsertItem(item) {
   if (!item?.id) return null;
+  if (item.type === "userMessage") removeMatchingLocalUserEcho(textFromContent(item.content));
   const old = findItemNode(item.id); const fresh = itemNode(item);
   if (!fresh) return old;
   fresh.dataset.itemId = item.id; clearEmptyMessages();
@@ -631,12 +661,18 @@ function upsertItem(item) {
 async function sendMessage(event) {
   event.preventDefault(); if (!state.current) return;
   const text = $("messageInput").value.trim(); if (!text && !state.attachments.length) return;
-  const mode = $("sendMode").value; const attachmentIds = state.attachments.map((a) => a.id);
+  if (state.attachments.some((item) => item.status === "uploading")) return toast("附件还在上传，完成后再发送");
+  const failed = state.attachments.find((item) => item.status === "failed");
+  if (failed) return toast(`${failed.name || "附件"} 上传失败，请重试或移除`);
+  const mode = $("sendMode").value; const attachmentIds = state.attachments.map((a) => a.id).filter(Boolean);
   $("sendBtn").disabled = true;
   try {
     const result = await api(`/api/threads/${encodeURIComponent(state.current.id)}/messages`, { method: "POST", body: { text, mode, attachmentIds, model: $("modelSelect").value, effort: $("effortSelect").value, summary: $("summarySelect").value } });
+    const localText = localSubmissionText(text, state.attachments);
     $("messageInput").value = ""; clearDraft(); autoSize(); clearAttachments(false);
-    if (result.queued) { toast("已加入队列"); await loadQueue(); }
+    if (result.queued) { appendLocalUserMessage(localText, result.item?.id, "queued"); toast("已加入队列"); await loadQueue(); }
+    else appendLocalUserMessage(localText, result.turn?.id || result.turnId);
+    if (result.queued) { }
     else if (result.turnId) { toast("已引导当前任务"); }
     else { state.activeTurnId = result.turn?.id || null; setActivity({ phase: "thinking", label: "正在思考", since: Date.now() }); scrollBottom(); }
   } catch (error) { toast(error.message); } finally { updateComposer(); }
@@ -644,7 +680,9 @@ async function sendMessage(event) {
 
 function updateComposer() {
   const can = state.control?.mode === "web" && state.control?.controller && state.current && !state.threadSyncing;
-  for (const id of ["messageInput", "sendMode", "attachBtn", "sendBtn", "modelSelect", "effortSelect", "summarySelect"]) $(id).disabled = !can;
+  const canAttach = Boolean(state.current || state.pendingThreadId);
+  for (const id of ["messageInput", "sendMode", "sendBtn", "modelSelect", "effortSelect", "summarySelect"]) $(id).disabled = !can;
+  $("attachBtn").disabled = !canAttach;
   $("interruptBtn").classList.add("hidden");
   $("sendBtn").classList.toggle("stop-mode", Boolean(state.activeTurnId));
   $("sendBtn").textContent = state.activeTurnId ? "■" : "↑";
@@ -671,13 +709,13 @@ function handlePaste(event) { const files = [...(event.clipboardData?.files || [
 async function addFiles(fileList) {
   const freeSlots = Math.max(0, 10 - state.attachments.length);
   const files = [...fileList].slice(0, freeSlots);
-  if ([...fileList].length > freeSlots) toast("最多可同时添加 10 个附件");
+  if ([...fileList].length > freeSlots) toast("\u6700\u591a\u53ef\u540c\u65f6\u6dfb\u52a0 10 \u4e2a\u9644\u4ef6");
   for (const file of files) await queueUpload(file);
 }
 async function queueUpload(file) {
-  if (!file?.size) return toast("无法上传空文件");
-  if (file.size > 50 * 1024 * 1024) return toast(`${file.name || "文件"} 超过 50MB`);
-  const clientId = crypto.randomUUID();
+  if (!file || typeof file.size !== "number") return toast("\u65e0\u6cd5\u8bfb\u53d6\u8fd9\u4e2a\u6587\u4ef6");
+  if (file.size > 50 * 1024 * 1024) return toast(`${file.name || "\u6587\u4ef6"} \u8d85\u8fc7 50MB`);
+  const clientId = createBrowserId("upload");
   const entry = { clientId, name: file.name || "clipboard.png", size: file.size, mime: file.type || "application/octet-stream", file, status: "uploading", progress: 0 };
   state.attachments.push(entry); renderAttachments();
   try {
@@ -685,7 +723,7 @@ async function queueUpload(file) {
     Object.assign(entry, result, { status: "ready", progress: 100 }); delete entry.file; renderAttachments();
   } catch (error) {
     if (error.name === "AbortError") return;
-    entry.status = "failed"; entry.error = error.message || "上传失败"; renderAttachments(); toast(`${entry.name}：${entry.error}`);
+    entry.status = "failed"; entry.error = error.message || "\u4e0a\u4f20\u5931\u8d25"; renderAttachments(); toast(`${entry.name}\uff1a${entry.error}`);
   }
 }
 function uploadFile(file, clientId, onProgress) {
@@ -1059,7 +1097,7 @@ function setActivity(activity) {
   if (state.activity === next || (state.activity && next && state.activity.phase === next.phase && state.activity.label === next.label && state.activity.detail === next.detail && state.activity.since === next.since)) return;
   state.activity = next; renderActivity();
 }
-function renderActivity() { const box = $("activityStatus"); if (!box) return; const disconnected = !state.socketConnected && state.control?.mode === "web"; const activity = disconnected ? { label: "连接断开，正在重连", since: Date.now() } : state.activity; box.classList.toggle("hidden", !activity); box.classList.toggle("offline", disconnected); if (!activity) return; const seconds = Math.max(0, Math.floor((Date.now() - Number(activity.since || Date.now())) / 1000)); const detail = activity.detail ? ` · ${activity.detail}` : ""; box.lastElementChild.textContent = `${activity.label}${seconds ? ` · ${seconds}秒` : ""}${detail}`; }
+function renderActivity() { const box = $("activityStatus"); if (!box) return; const disconnected = !state.socketConnected && state.control?.mode === "web"; const activity = disconnected ? { phase: "offline", label: "连接断开，正在重连", since: Date.now() } : state.activity; box.classList.toggle("hidden", !activity); box.classList.toggle("offline", disconnected); for (const cls of [...box.classList]) if (cls.startsWith("phase-")) box.classList.remove(cls); if (!activity) return; box.classList.add(`phase-${activity.phase || "working"}`); const seconds = Math.max(0, Math.floor((Date.now() - Number(activity.since || Date.now())) / 1000)); const detail = activity.detail ? ` · ${activity.detail}` : ""; box.lastElementChild.textContent = `${activity.label}${seconds ? ` · ${seconds}秒` : ""}${detail}`; }
 function activityLabel(item = {}) { const labels = { reasoning: "正在思考", commandExecution: "正在执行命令", fileChange: "正在修改文件", webSearch: "正在搜索", mcpToolCall: "正在调用工具", dynamicToolCall: "正在调用工具", imageGeneration: "正在生成图片" }; return labels[item.type] || "正在处理"; }
 function activityDetail(item = {}) { return item.type === "commandExecution" ? String(item.command || "").replace(/\s+/g, " ").slice(0, 80) : ""; }
 function reasoningItem(itemId, createNode = true) { const id = String(itemId || ""); let stream = state.reasoningStreams.get(id); if (!stream) { stream = createReasoningState({ status: "inProgress" }); state.reasoningStreams.set(id, stream); } let node = findItemNode(id); if (!node && createNode) { clearEmptyMessages(); node = reasoningNode({ status: "inProgress" }, stream); node.dataset.itemId = id; $("messages").append(node); state.itemNodes.set(id, node); } return { node, stream }; }
@@ -1181,31 +1219,44 @@ function renderAccountTokenTimeline(payload = {}) {
 
 async function switchAccount() {
   closeAccountMenu();
-  if (state.control?.mode !== "web") return toast("请先接管 Codex，再切换桌面和 Web 的同一账号");
   let profiles;
-  try { ({ profiles } = await api("/api/accounts")); } catch (error) { return toast(`无法读取账号备份：${error.message}`); }
-  if (!profiles?.length) return toast("未找到账号备份，请先用账号备份工具保存账号");
-  const options = profiles.map((profile, index) => `${index + 1}. ${profile.label || "未命名账号"}${profile.hint ? `（${profile.hint}）` : ""}`).join("\n");
-  const selected = Number(prompt(`选择要切换的账号：\n${options}`, "1"));
+  try { ({ profiles } = await api("/api/accounts")); } catch (error) { return toast(`\u65e0\u6cd5\u8bfb\u53d6\u8d26\u53f7\u5907\u4efd\uff1a${error.message}`); }
+  if (!profiles?.length) return toast("\u672a\u627e\u5230\u8d26\u53f7\u5907\u4efd\uff0c\u8bf7\u5148\u7528\u8d26\u53f7\u5907\u4efd\u5de5\u5177\u4fdd\u5b58\u8d26\u53f7");
+  const busy = Object.keys(state.control?.activeTurns || {}).length || Number(state.control?.queuedCount || 0) || Number(state.control?.pendingRequests?.length || 0);
+  if (busy) return toast("\u5f53\u524d\u6709\u8fd0\u884c\u3001\u5ba1\u6279\u6216\u6392\u961f\u5185\u5bb9\uff0c\u8bf7\u5904\u7406\u5b8c\u518d\u5207\u6362\u8d26\u53f7");
+  const options = profiles.map((profile, index) => `${index + 1}. ${profile.label || "\u672a\u547d\u540d\u8d26\u53f7"}${profile.hint ? `\uff08${profile.hint}\uff09` : ""}`).join("\n");
+  const selected = Number(prompt(`\u9009\u62e9\u8981\u5207\u6362\u7684\u8d26\u53f7\uff1a\n${options}`, "1"));
   if (!Number.isInteger(selected) || selected < 1 || selected > profiles.length) return;
   const profile = profiles[selected - 1];
-  if (!confirm(`切换到“${profile.label || "未命名账号"}”？\n\n会安全替换桌面和 Web 共用的登录账号，并重启 Web Codex。进行中的任务、审批或排队消息必须先处理完。`)) return;
+  if (!confirm(`\u5207\u6362\u5230\u201c${profile.label || "\u672a\u547d\u540d\u8d26\u53f7"}\u201d\uff1f\n\n\u4f1a\u66ff\u6362\u684c\u9762\u548c Web \u5171\u7528\u7684\u767b\u5f55\u8d26\u53f7\uff0c\u5e76\u77ed\u6682\u91cd\u542f Web Codex\u3002\u8fdb\u884c\u4e2d\u7684\u4efb\u52a1\u3001\u5ba1\u6279\u6216\u6392\u961f\u6d88\u606f\u5fc5\u987b\u5148\u5904\u7406\u5b8c\u3002`)) return;
   $("accountSwitchOverlay").classList.remove("hidden");
   try {
     const result = await api("/api/accounts/activate", { method: "POST", body: { profileId: profile.id } });
-    toast(`已切换到 ${result.profile?.label || profile.label || "所选账号"}，正在重新连接…`);
+    toast(`\u5df2\u5207\u6362\u5230 ${result.profile?.label || profile.label || "\u6240\u9009\u8d26\u53f7"}\uff0c\u6b63\u5728\u91cd\u65b0\u8fde\u63a5\u2026`);
     setTimeout(() => location.reload(), Math.max(1500, Number(result.reconnectAfterMs) || 4500));
   } catch (error) {
     $("accountSwitchOverlay").classList.add("hidden");
-    toast(`账号切换失败：${error.message}`);
+    toast(`\u8d26\u53f7\u5207\u6362\u5931\u8d25\uff1a${error.message}`);
   }
 }
 
+function createBrowserId(prefix = "id") {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  if (typeof globalThis.crypto?.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0"));
+    return `${prefix}-${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+  }
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
 async function resetRateLimit() {
   const count = Number((state.usage?.rateLimits?.rateLimitResetCredits?.availableCount) || 0);
   if (!count) return;
   if (!confirm(`将消耗 1 次额度重置，当前可用 ${count} 次。是否继续？`)) return;
-  state.resetAttemptId ||= crypto.randomUUID();
+  state.resetAttemptId ||= createBrowserId("reset");
   $("resetLimitBtn").disabled = true;
   $("usageMessage").textContent = "正在重置使用限额…";
   try {
@@ -1254,6 +1305,44 @@ function restoreDraft(threadId) {
 }
 function clearDraft(threadId = state.current?.id) { const key = draftKey(threadId); if (key) try { localStorage.removeItem(key); } catch { } }
 let toastTimer; function toast(text) { clearTimeout(toastTimer); $("toast").textContent = text; $("toast").classList.remove("hidden"); toastTimer = setTimeout(() => $("toast").classList.add("hidden"), 4500); }
+
+function localSubmissionText(text, attachments = []) {
+  const names = attachments.map((item) => item.name).filter(Boolean);
+  const suffix = names.length ? `\n\n附件：${names.join("、")}` : "";
+  return `${text || "[附件消息]"}${suffix}`;
+}
+
+function appendLocalUserMessage(text, turnId, status = "sent") {
+  if (!text) return;
+  clearEmptyMessages();
+  const id = `local-user:${turnId || Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const node = messageNode("user", text);
+  node.dataset.itemId = id;
+  node.dataset.localUser = "true";
+  node.dataset.localUserText = text;
+  if (status === "queued") {
+    node.classList.add("queued");
+    const badge = document.createElement("small");
+    badge.className = "local-message-status";
+    badge.textContent = "已排队，上一条完成后自动发送";
+    node.append(badge);
+  }
+  $("messages").append(node);
+  state.itemNodes.set(id, node);
+  scrollBottom();
+}
+
+function removeMatchingLocalUserEcho(text) {
+  const value = String(text || "").trim();
+  if (!value) return;
+  for (const node of $("messages").querySelectorAll(':scope > .message.user[data-local-user="true"]')) {
+    if (String(node.dataset.localUserText || "").trim() === value) {
+      state.itemNodes.delete(node.dataset.itemId || "");
+      node.remove();
+      return;
+    }
+  }
+}
 
 if ("serviceWorker" in navigator && (location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname))) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));

@@ -32,6 +32,7 @@ const serverEnv = {
   CODEX_WEB_SESSION_HOURS: "24",
   CODEX_WEB_DATA_DIR: path.join(temp, "data"),
   CODEX_WEB_UPLOAD_DIR: path.join(temp, "uploads"),
+  CODEX_WEB_PUBLIC_URL: "http://public.example.test:44077",
   CODEX_WEB_TEST_DESKTOP_STATE_FILE: desktopStateFile,
   CODEX_WEB_SESSION_ROOT: desktopSessionsRoot,
 };
@@ -74,7 +75,25 @@ const stopServer = async (processHandle) => {
 try {
   child = await startServer();
   await request("/api/login", { method: "POST", body: { password } });
-  if (!/Max-Age=86400/i.test(lastSetCookie)) throw new Error(`Unexpected session lifetime: ${lastSetCookie}`);
+  if (!/Max-Age=86400/i.test(lastSetCookie) || !/SameSite=Lax/i.test(lastSetCookie)) throw new Error(`Unexpected session cookie: ${lastSetCookie}`);
+  const readonlyUploadResponse = await fetch(`${base}/api/uploads?name=${encodeURIComponent("readonly-upload.txt")}&type=text%2Fplain`, {
+    method: "POST", headers: { Cookie: cookie, Origin: base, "Content-Type": "application/octet-stream" }, body: Buffer.from("READONLY_UPLOAD_OK"),
+  });
+  const readonlyUpload = await readonlyUploadResponse.json();
+  if (!readonlyUploadResponse.ok || !readonlyUpload.id || readonlyUpload.size !== 18) throw new Error(`Read-only upload was blocked: ${JSON.stringify(readonlyUpload)}`);
+  const emptyUploadResponse = await fetch(`${base}/api/uploads?name=${encodeURIComponent("empty-marker.txt")}&type=text%2Fplain`, {
+    method: "POST", headers: { Cookie: cookie, Origin: base, "Content-Type": "application/octet-stream" }, body: Buffer.alloc(0),
+  });
+  const emptyUpload = await emptyUploadResponse.json();
+  if (!emptyUploadResponse.ok || !emptyUpload.id || emptyUpload.size !== 0) throw new Error(`Empty file upload was blocked: ${JSON.stringify(emptyUpload)}`);
+  const publicOriginUpload = await fetch(`${base}/api/uploads?name=${encodeURIComponent("public-origin.txt")}&type=text%2Fplain`, {
+    method: "POST", headers: { Cookie: cookie, Origin: "http://public.example.test:44077", "Content-Type": "application/octet-stream" }, body: Buffer.from("PUBLIC_ORIGIN_OK"),
+  });
+  if (!publicOriginUpload.ok) throw new Error(`Configured public origin upload was blocked: ${publicOriginUpload.status}`);
+  const badOriginUpload = await fetch(`${base}/api/uploads?name=${encodeURIComponent("bad-origin.txt")}&type=text%2Fplain`, {
+    method: "POST", headers: { Cookie: cookie, Origin: "http://evil.example.test", "Content-Type": "application/octet-stream" }, body: Buffer.from("BAD_ORIGIN"),
+  });
+  if (badOriginUpload.ok) throw new Error("Unexpected origin upload was allowed");
   await new Promise((resolve) => setTimeout(resolve, 350));
   let desktopLiveOutput = "";
   let desktopLiveCompleted = false;

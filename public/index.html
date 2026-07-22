@@ -14,80 +14,131 @@
   <link rel="apple-touch-icon" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css?v=1.4.3-s2">
   <link rel="stylesheet" href="/layout-fix.css?v=1.4.3-s2">
-    <link rel="stylesheet" href="/modern-ui.css?v=1.4.6-stability1">
+  <link rel="stylesheet" href="/modern-ui.css?v=1.4.7-stability1">
 </head>
 <body>
   <section id="loginView" class="center-card hidden">
     <form id="loginForm" class="login-card">
-      <div class="logo">C</div><span class="eyebrow">PRIVATE AI WORKSPACE</span>
-      <h1>欢迎回来</h1><p>安全连接到这台电脑上的 Codex</p>
-      <label>访问密码<input id="password" type="password" autocomplete="current-password" minlength="8" required autofocus placeholder="输入访问密码"></label>
-      <label class="remember-row"><input id="rememberPassword" type="checkbox"> <span>记住密码，下次自动填入</span></label>
-      <button type="submit">进入工作区 <span>→</span></button><div id="loginError" class="error"></div>
+      <div class="logo">C</div>
+      <span class="eyebrow">PRIVATE AI WORKSPACE</span>
+      <h1>欢迎回来</h1>
+      <p>安全连接到这台电脑上的 Codex</p>
+      <label>
+        访问密码
+        <input id="password" type="password" autocomplete="current-password" minlength="8" required autofocus placeholder="输入访问密码">
+      </label>
+      <label class="remember-row">
+        <input id="rememberPassword" type="checkbox">
+        <span>记住密码，24 小时内自动填入</span>
+      </label>
+      <button type="submit">进入工作区 <span>→</span></button>
+      <div id="loginError" class="error"></div>
     </form>
   </section>
 
   <main id="appView" class="app hidden">
     <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
     <aside id="sidebar" class="sidebar">
-      <header><div class="brand-mark">C</div><strong>Codex <em>Remote</em></strong><span id="statusDot" class="dot"></span><button id="sidebarCloseBtn" class="sidebar-close" aria-label="关闭任务列表">×</button></header>
-      <div class="sidebar-actions"><button id="newThreadBtn" class="nav-action"><span>＋</span> 新建任务</button></div>
-      <div class="section-label project-section-label"><span>项目</span><button id="addProjectBtn" type="button" title="添加项目文件夹" aria-label="添加项目文件夹">＋</button></div>
+      <header>
+        <div class="brand-mark">C</div>
+        <strong>Codex <em>Remote</em></strong>
+        <span id="statusDot" class="dot"></span>
+        <button id="sidebarCloseBtn" class="sidebar-close" aria-label="关闭任务列表">×</button>
+      </header>
+      <div class="sidebar-actions">
+        <button id="newThreadBtn" class="nav-action"><span>＋</span> 新建任务</button>
+      </div>
+      <div class="section-label project-section-label">
+        <span>项目</span>
+        <button id="addProjectBtn" type="button" title="添加项目文件夹" aria-label="添加项目文件夹">＋</button>
+      </div>
       <nav id="projectList" class="project-list"></nav>
-      <div class="toolbar"><span>⌕</span><input id="search" type="search" placeholder="搜索任务"></div>
+      <div class="toolbar">
+        <span>⌕</span>
+        <input id="search" type="search" placeholder="搜索任务">
+      </div>
       <div class="section-label">最近任务</div>
       <nav id="threadList" class="thread-list"></nav>
       <footer class="sidebar-footer">
-        <button id="accountMenuBtn" class="account-button" type="button" aria-haspopup="menu" aria-expanded="false"><span class="account-chip">AW</span><span>我的 Codex</span><span class="account-chevron">⌃</span></button>
+        <button id="accountMenuBtn" class="account-button" type="button" aria-haspopup="menu" aria-expanded="false">
+          <span class="account-chip">AW</span>
+          <span>我的 Codex</span>
+          <span class="account-chevron">⌄</span>
+        </button>
         <button id="refreshBtn" class="ghost" title="刷新">↻</button>
         <div id="accountMenu" class="account-menu hidden" role="menu">
           <div class="account-menu-head"><span class="account-chip">AW</span><strong>我的 Codex</strong></div>
-          <button id="usageMenuBtn" type="button" role="menuitem"><span>◴</span> 使用情况</button>
+          <button id="usageMenuBtn" type="button" role="menuitem"><span>◔</span> 使用情况</button>
           <button id="switchAccountMenuBtn" type="button" role="menuitem"><span>⇄</span> 切换账号</button>
           <button id="themeMenuBtn" type="button" role="menuitem"><span>◐</span> 外观：跟随系统</button>
-          <button id="logoutBtn" type="button" role="menuitem"><span>↪</span> 退出登录</button>
+          <button id="logoutBtn" type="button" role="menuitem"><span>↩</span> 退出登录</button>
         </div>
       </footer>
     </aside>
 
     <section class="chat-shell">
-      <div id="controlBar" class="control-bar"><span class="control-spark">✦</span><span id="controlText">正在检查状态…</span><small id="controlMeta" class="control-meta"></small><div class="control-actions"><button id="fullAccessBtn" class="full-access hidden">完全访问</button><button id="takeoverBtn">接管 Codex</button><button id="releaseBtn" class="hidden">释放到桌面 App</button></div></div>
-      <div id="updateBanner" class="update-banner hidden"><div><strong id="updateTitle">发现新版本</strong><small id="updateDetail"></small></div><a id="updateReleaseLink" target="_blank" rel="noopener">查看说明</a><button id="updateNowBtn" type="button">立即更新</button></div>
+      <div id="controlBar" class="control-bar">
+        <span class="control-spark">✦</span>
+        <span id="controlText">正在检查状态…</span>
+        <small id="controlMeta" class="control-meta"></small>
+        <div class="control-actions">
+          <button id="fullAccessBtn" class="full-access hidden">完全访问</button>
+          <button id="takeoverBtn">接管 Codex</button>
+          <button id="releaseBtn" class="hidden">释放到桌面 App</button>
+        </div>
+      </div>
+      <div id="updateBanner" class="update-banner hidden">
+        <div><strong id="updateTitle">发现新版本</strong><small id="updateDetail"></small></div>
+        <a id="updateReleaseLink" target="_blank" rel="noopener">查看说明</a>
+        <button id="updateNowBtn" type="button">立即更新</button>
+      </div>
       <header class="chat-header">
         <button id="menuBtn" class="icon-button" aria-label="打开任务列表">☰</button>
-        <div class="chat-heading"><h2 id="chatTitle">选择一个任务</h2><small id="chatMeta">从任务列表开始，或创建新任务</small></div>
+        <div class="chat-heading">
+          <h2 id="chatTitle">选择一个任务</h2>
+          <small id="chatMeta">从任务列表开始，或创建新任务</small>
+        </div>
         <span id="activityStatus" class="activity hidden"><i></i><span>正在思考</span></span>
         <button id="interruptBtn" class="danger hidden">停止</button>
       </header>
 
-      <div id="messages" class="messages"><div class="empty"><span>✦</span><strong>准备好开始</strong><small>选择一个任务查看历史记录</small></div></div>
-      <button id="newMessagesBtn" class="new-messages hidden" type="button">回到底部 ↓</button>
+      <div id="messages" class="messages">
+        <div class="empty"><span>✦</span><strong>准备好开始</strong><small>选择一个任务查看历史记录</small></div>
+      </div>
+      <button id="newMessagesBtn" class="new-messages hidden" type="button">回到底部 →</button>
       <div class="bottom-stack">
-        <section id="queuePanel" class="queue-panel hidden"><header><strong>排队消息</strong><button id="clearQueueBtn" class="ghost">清空</button></header><div id="queueList"></div></section>
+        <section id="queuePanel" class="queue-panel hidden">
+          <header><strong>排队消息</strong><button id="clearQueueBtn" class="ghost">清空</button></header>
+          <div id="queueList"></div>
+        </section>
         <div id="approval" class="approval hidden"></div>
         <div id="attachmentTray" class="attachment-tray hidden"></div>
 
         <form id="composer" class="composer">
-        <input id="fileInput" type="file" multiple hidden accept="image/*,.txt,.md,.json,.csv,.log,.pdf,.doc,.docx,.xls,.xlsx,.zip">
-        <textarea id="messageInput" rows="1" placeholder="给 Codex 发送任务…" disabled></textarea>
-        <div class="composer-tools left-tools">
-          <button id="attachBtn" type="button" class="attach" disabled title="添加附件">＋</button>
-          <button id="permissionShortcut" type="button" class="permission-shortcut" title="权限模式">完全访问</button>
-          <button id="mobileToolsBtn" type="button" class="mobile-tools-btn">参数</button>
-        </div>
-        <div id="composerSettings" class="composer-tools right-tools">
-          <label><span>发送</span><select id="sendMode" disabled title="发送方式"><option value="auto">自动</option><option value="steer">引导</option><option value="queue">排队</option></select></label>
-          <label><span>模型</span><select id="modelSelect" disabled title="模型"><option value="">默认模型</option></select></label>
-          <label><span>思考</span><select id="effortSelect" disabled title="思考强度"><option value="">默认</option></select></label>
-          <label><span>摘要</span><select id="summarySelect" disabled title="推理摘要"><option value="">跟随 App</option><option value="auto">自动摘要</option><option value="concise">简洁摘要</option><option value="detailed">详细摘要</option><option value="none">不显示摘要</option></select></label>
-        </div>
-        <button id="sendBtn" type="submit" disabled title="发送" aria-label="发送">↑</button>
+          <input id="fileInput" type="file" multiple hidden>
+          <textarea id="messageInput" rows="1" placeholder="给 Codex 发送任务…" disabled></textarea>
+          <div class="composer-tools left-tools">
+            <button id="attachBtn" type="button" class="attach" disabled title="添加附件" aria-label="添加附件">＋</button>
+            <button id="permissionShortcut" type="button" class="permission-shortcut" title="权限模式">完全访问</button>
+            <button id="mobileToolsBtn" type="button" class="mobile-tools-btn">参数</button>
+          </div>
+          <div id="composerSettings" class="composer-tools right-tools">
+            <label><span>发送</span><select id="sendMode" disabled title="发送方式"><option value="auto">自动</option><option value="steer">引导</option><option value="queue">排队</option></select></label>
+            <label><span>模型</span><select id="modelSelect" disabled title="模型"><option value="">默认模型</option></select></label>
+            <label><span>思考</span><select id="effortSelect" disabled title="思考强度"><option value="">默认</option></select></label>
+            <label><span>摘要</span><select id="summarySelect" disabled title="推理摘要"><option value="">跟随 App</option><option value="auto">自动摘要</option><option value="concise">简洁摘要</option><option value="detailed">详细摘要</option><option value="none">不显示摘要</option></select></label>
+          </div>
+          <button id="sendBtn" type="submit" disabled title="发送" aria-label="发送">↑</button>
         </form>
       </div>
       <div id="toast" class="toast hidden"></div>
     </section>
   </main>
-  <div id="accountSwitchOverlay" class="account-switch-overlay hidden" role="status" aria-live="assertive"><div><i></i><strong>正在切换账号</strong><small>正在安全替换登录信息并重启 Web Codex；请保持此页面打开，约 5 秒后自动重新连接。</small></div></div>
+
+  <div id="accountSwitchOverlay" class="account-switch-overlay hidden" role="status" aria-live="assertive">
+    <div><i></i><strong>正在切换账号</strong><small>正在安全替换登录信息并重启 Web Codex；请保持页面打开，约 5 秒后自动重新连接。</small></div>
+  </div>
+
   <div id="usageModal" class="modal-backdrop hidden" role="presentation">
     <section class="usage-dialog" role="dialog" aria-modal="true" aria-labelledby="usageTitle">
       <header><h2 id="usageTitle">使用量</h2><button id="usageCloseBtn" type="button" aria-label="关闭">×</button></header>
@@ -98,7 +149,7 @@
           <div class="usage-meter"><span><i id="usageMeterFill"></i></span><b id="usageRemaining">剩余 --</b></div>
         </section>
         <section class="usage-card reset-card">
-          <div><strong>使用限额重置</strong><small id="usageCreditDetail">使用账户获得的重置次数</small></div>
+          <div><strong>使用限额重置</strong><small id="usageCreditDetail">使用账号获得的重置次数</small></div>
           <button id="resetLimitBtn" type="button"><span id="resetCreditCount">可用 0 次</span><b>⌄</b></button>
         </section>
         <section class="usage-stats">
@@ -115,19 +166,21 @@
       </div>
     </section>
   </div>
+
   <div id="projectModal" class="modal-backdrop hidden" role="presentation">
     <form id="projectForm" class="project-dialog" role="dialog" aria-modal="true" aria-labelledby="projectTitle">
       <header><div><h2 id="projectTitle">添加项目</h2><p>选择这台电脑上已有的项目文件夹</p></div><button id="projectCloseBtn" type="button" aria-label="关闭">×</button></header>
       <label class="project-field"><span>项目名称 <small>可选</small></span><input id="projectName" maxlength="80" autocomplete="off" placeholder="自动使用文件夹名称"></label>
-      <label class="project-field"><span>文件夹路径</span><div class="project-path-row"><input id="projectPath" required autocomplete="off" spellcheck="false" placeholder="例如 D:\\我的项目"><button id="projectBrowseBtn" type="button">浏览</button></div></label>
+      <label class="project-field"><span>文件夹路径</span><div class="project-path-row"><input id="projectPath" required autocomplete="off" spellcheck="false" placeholder="例如 D:\我的项目"><button id="projectBrowseBtn" type="button">浏览</button></div></label>
       <section id="directoryBrowser" class="directory-browser hidden">
-        <header><button id="directoryUpBtn" type="button">← 上一级</button><strong id="directoryCurrent">选择磁盘</strong><button id="directorySelectBtn" type="button">选择当前目录</button></header>
+        <header><button id="directoryUpBtn" type="button">↑ 上一级</button><strong id="directoryCurrent">选择磁盘</strong><button id="directorySelectBtn" type="button">选择当前目录</button></header>
         <div id="directoryList" class="directory-list"></div>
       </section>
       <p id="projectError" class="project-error"></p>
       <footer><button id="projectCancelBtn" type="button">取消</button><button id="projectSaveBtn" type="submit">添加并使用</button></footer>
     </form>
   </div>
-  <script type="module" src="/app.js?v=1.4.6-stability1"></script>
+
+  <script type="module" src="/app.js?v=1.4.7-stability1"></script>
 </body>
 </html>

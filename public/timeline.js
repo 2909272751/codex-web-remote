@@ -49,6 +49,7 @@ export function appendCommandOutput(node, delta) {
   if (!output) return;
   if (output.dataset.placeholder === "true") { output.textContent = ""; delete output.dataset.placeholder; }
   output.textContent = cappedAppend(output.textContent, delta);
+  updateOutputOverflow(output);
   node.open = true;
 }
 
@@ -85,6 +86,7 @@ function commandItem(item, { lazy = false } = {}) {
     body.append(section("命令", codeBlock(item.command || "")));
     const output = codeBlock(item.aggregatedOutput || "等待输出…"); output.dataset.stream = "command";
     if (!item.aggregatedOutput) output.dataset.placeholder = "true";
+    updateOutputOverflow(output);
     body.append(section("输出", output));
   });
   return node;
@@ -231,13 +233,24 @@ function toolImageSource(entry) {
   }
   return "";
 }
-function diffStats(diff) { let add = 0; let del = 0; for (const line of String(diff || "").split(/\r?\n/)) { if (line.startsWith("+") && !line.startsWith("+++")) add += 1; if (line.startsWith("-") && !line.startsWith("---")) del += 1; } return { add, del, label: `+${add} −${del}` }; }
+function diffStats(diff) {
+  let add = 0; let del = 0;
+  for (const line of String(diff || "").split(/\r?\n/)) {
+    if (line.startsWith("+") && !line.startsWith("+++")) add += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) del += 1;
+  }
+  return { add, del, label: `+${add} -${del}` };
+}
 function planOverallStatus(plan = []) { return plan.some((item) => item.status === "inProgress") ? "inProgress" : plan.length && plan.every((item) => item.status === "completed") ? "completed" : "pending"; }
 function statusClass(status) { return String(status || "completed").replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`); }
-function statusText(status) { return ({ inProgress: "运行中", completed: "完成", failed: "失败", declined: "已拒绝", pending: "待处理" })[status] || String(status || "完成"); }
+function statusText(status) { return ({ inProgress: "\u8fd0\u884c\u4e2d", completed: "\u5b8c\u6210", failed: "\u5931\u8d25", declined: "\u5df2\u62d2\u7edd", pending: "\u5f85\u5904\u7406" })[status] || String(status || "\u5b8c\u6210"); }
 function formatDuration(ms) { const value = Number(ms || 0); return value < 1_000 ? `${value}ms` : `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}s`; }
-function compact(value) { return String(value || "").replace(/\s+/g, " ").trim().slice(0, 180); }
-function cappedAppend(current, delta) { const joined = `${current || ""}${delta || ""}`; return joined.length > OUTPUT_LIMIT ? `…较早输出已折叠…\n${joined.slice(-OUTPUT_LIMIT)}` : joined; }
+function compact(value) { return String(value || "").replace(/s+/g, " ").trim().slice(0, 180); }
+function cappedAppend(current, delta) { const joined = `${current || ""}${delta || ""}`; return joined.length > OUTPUT_LIMIT ? `\u2026\u8f83\u65e9\u8f93\u51fa\u5df2\u6298\u53e0\u2026\n${joined.slice(-OUTPUT_LIMIT)}` : joined; }
+function updateOutputOverflow(output) {
+  const text = String(output?.textContent || "");
+  if (text.length > 6_000 || text.split(/\r?\n/).length > 120) output.classList.add("timeline-code-long");
+}
 function pretty(value) { if (typeof value === "string") return value; try { return JSON.stringify(value ?? {}, null, 2); } catch { return String(value); } }
-function friendlyType(type) { return String(type || "事件").replace(/([a-z])([A-Z])/g, "$1 $2"); }
-function iconFor(kind) { return ({ search: "⌕", image: "▧", wait: "◷", review: "✓", context: "↻", agents: "◎", generic: "•" })[kind] || "•"; }
+function friendlyType(type) { return String(type || "??").replace(/([a-z])([A-Z])/g, "$1 $2"); }
+function iconFor(kind) { return ({ search: "?", image: "?", wait: "?", review: "?", context: "?", agents: "?", generic: "?" })[kind] || "?"; }

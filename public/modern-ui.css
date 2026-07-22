@@ -12,6 +12,9 @@
   --ui-success: #20a879;
   --ui-warn: #c78628;
   --ui-danger: #bd3748;
+  --ui-user-bg: #ebe7ff;
+  --ui-user-text: #1c2130;
+  --ui-user-border: #cfc7ff;
   --ui-shadow: 0 16px 44px rgba(32, 40, 75, .09);
   --ui-radius-sm: 10px;
   --ui-radius-md: 14px;
@@ -32,6 +35,9 @@
   --ui-success: #55d7a5;
   --ui-warn: #e5b45e;
   --ui-danger: #ff8994;
+  --ui-user-bg: #30285d;
+  --ui-user-text: #f8f6ff;
+  --ui-user-border: #6f61c9;
   --ui-shadow: 0 18px 48px rgba(0, 0, 0, .28);
 }
 
@@ -60,6 +66,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .activity { border: 1px solid color-mix(in srgb, var(--ui-accent) 24%, var(--ui-line)); background: color-mix(in srgb, var(--ui-accent) 10%, var(--ui-surface)); color: var(--ui-accent); border-radius: 999px; padding: 5px 10px; }
 .activity::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; margin-right: 6px; animation: ui-pulse 1.5s ease-in-out infinite; }
+.activity.phase-thinking { color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 11%, var(--ui-surface)); }
+.activity.phase-commandExecution, .activity.phase-mcpToolCall, .activity.phase-dynamicToolCall, .activity.phase-working { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 10%, var(--ui-surface)); }
+.activity.phase-approval, .activity.phase-input, .activity.phase-queue { color: var(--ui-warn); background: color-mix(in srgb, var(--ui-warn) 12%, var(--ui-surface)); }
+.activity.phase-offline, .activity.phase-error { color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 10%, var(--ui-surface)); }
 .composer, .queue-panel, .approval, .attachment-tray, .timeline-card, .toast { background: var(--ui-elevated); border-color: var(--ui-line); box-shadow: var(--ui-shadow); border-radius: var(--ui-radius-lg); }
 .composer { transition: box-shadow var(--ui-normal) ease, border-color var(--ui-normal) ease, transform var(--ui-normal) ease; }
 .composer:focus-within { border-color: color-mix(in srgb, var(--ui-accent) 50%, var(--ui-line)); box-shadow: 0 18px 54px color-mix(in srgb, var(--ui-accent) 16%, transparent); }
@@ -76,9 +86,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .attachment-progress { display: block; height: 3px; overflow: hidden; border-radius: 99px; background: var(--ui-line); }
 .attachment-progress::after { content: ""; display: block; width: var(--upload-progress); height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--ui-accent), var(--ui-accent-2)); transition: width var(--ui-fast) ease; }
 .message { animation: ui-fade-up .22s ease both; }
-.message.user { background: color-mix(in srgb, var(--ui-accent) 11%, var(--ui-surface)); border: 1px solid color-mix(in srgb, var(--ui-accent) 10%, var(--ui-line)); }
+.message.user { background: var(--ui-user-bg); color: var(--ui-user-text); border: 1px solid var(--ui-user-border); }
+.message.user .role { color: color-mix(in srgb, var(--ui-user-text) 58%, transparent); }
+.message.user.queued { border-color: color-mix(in srgb, var(--ui-warn) 55%, var(--ui-user-border)); box-shadow: 0 10px 30px color-mix(in srgb, var(--ui-warn) 14%, transparent); }
+.local-message-status { display: block; margin-top: 8px; color: color-mix(in srgb, var(--ui-user-text) 70%, transparent); font-size: 12px; line-height: 1.35; }
 .message.assistant { background: transparent; }
 .message pre, .timeline-code { background: color-mix(in srgb, var(--ui-surface-2) 90%, #111827); color: var(--ui-text); border: 1px solid var(--ui-line); border-radius: var(--ui-radius-sm); }
+.timeline-code-long { max-height: min(44dvh, 420px); overflow: auto; overscroll-behavior: contain; }
+.timeline-code-long::before { content: "长输出已折叠显示，可在此区域滚动查看"; display: block; position: sticky; top: 0; z-index: 1; margin: -10px -10px 10px; padding: 7px 10px; background: color-mix(in srgb, var(--ui-surface-2) 94%, transparent); color: var(--ui-muted); border-bottom: 1px solid var(--ui-line); font-family: Inter, "Segoe UI", system-ui, sans-serif; font-size: 12px; }
 .timeline-card { animation: ui-pop .2s ease both; }
 .status-chip, .queue-count { border-radius: 999px; }
 .modal-backdrop { background: rgba(14, 18, 28, .42); backdrop-filter: blur(5px); }
@@ -436,6 +451,8 @@ input:-webkit-autofill:focus {
   .messages {
     min-height: 0;
     padding: 18px var(--mobile-edge-r) 12px var(--mobile-edge);
+    overscroll-behavior: contain;
+    scroll-padding-bottom: calc(128px + var(--mobile-bottom));
   }
   .message {
     font-size: 14px;
@@ -506,6 +523,19 @@ input:-webkit-autofill:focus {
   }
   .toast {
     bottom: calc(var(--mobile-bottom) + 116px);
+  }
+  html.keyboard-active .chat-shell {
+    grid-template-rows: auto minmax(0, auto) minmax(0, 1fr) auto;
+  }
+  html.keyboard-active .messages {
+    padding-bottom: 8px;
+    scroll-padding-bottom: calc(154px + var(--mobile-bottom));
+  }
+  html.keyboard-active .bottom-stack {
+    max-height: min(46dvh, 340px);
+  }
+  html.keyboard-active .composer textarea {
+    max-height: min(16dvh, 96px);
   }
   .sidebar {
     width: min(92vw, 380px);

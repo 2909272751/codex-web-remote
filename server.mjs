@@ -36,6 +36,9 @@ const currentVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"
 const sessionIndexFile = path.join(process.env.USERPROFILE || root, ".codex", "session_index.jsonl");
 const sessionRoot = process.env.CODEX_WEB_SESSION_ROOT ? path.resolve(process.env.CODEX_WEB_SESSION_ROOT) : path.join(process.env.USERPROFILE || root, ".codex", "sessions");
 const uploadDir = process.env.CODEX_WEB_UPLOAD_DIR ? path.resolve(process.env.CODEX_WEB_UPLOAD_DIR) : path.join(process.env.USERPROFILE || root, ".codex", "web-uploads");
+const launcherSettingsFile = process.env.CODEX_WEB_SETTINGS_FILE
+  ? path.resolve(process.env.CODEX_WEB_SETTINGS_FILE)
+  : path.join(process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || root, "AppData", "Local"), "CodexWebRemote", "settings.json");
 const testMode = process.env.CODEX_WEB_TEST_MODE === "1";
 const testDesktopStateFile = testMode && process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE ? path.resolve(process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE) : "";
 const testDropTurnCompleted = testMode && process.env.CODEX_WEB_TEST_DROP_TURN_COMPLETED === "1";
@@ -401,17 +404,24 @@ app.get("/api/accounts", requireAuth, asyncRoute(async (req, res) => {
   res.json({ profiles: Array.isArray(result.profiles) ? result.profiles : [] });
 }));
 
-app.post("/api/accounts/activate", requireAuth, requireWebMode, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+app.post("/api/accounts/activate", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
   const profileId = String(req.body?.profileId || "");
-  if (!/^[A-Za-z0-9_-]{6,80}$/.test(profileId)) return res.status(400).json({ error: "账号档案标识无效" });
-  if (transition) return res.status(409).json({ error: "当前正在切换状态，请稍后再试" });
+  if (!/^[A-Za-z0-9_-]{6,80}$/.test(profileId)) return res.status(400).json({ error: "\u8d26\u53f7\u6863\u6848\u6807\u8bc6\u65e0\u6548" });
+  if (transition) return res.status(409).json({ error: "\u5f53\u524d\u6b63\u5728\u5207\u6362\u72b6\u6001\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5" });
   const queued = Object.values(queues).reduce((sum, list) => sum + list.length, 0);
-  if (activeTurns.size || threadSubmissions.size || pendingApprovals.size || queued) return res.status(409).json({ error: "请先完成、停止或清空正在运行的任务、审批和排队消息，再切换账号" });
+  if (activeTurns.size || threadSubmissions.size || pendingApprovals.size || queued) return res.status(409).json({ error: "\u8bf7\u5148\u5b8c\u6210\u3001\u505c\u6b62\u6216\u6e05\u7a7a\u6b63\u5728\u8fd0\u884c\u7684\u4efb\u52a1\u3001\u5ba1\u6279\u548c\u6392\u961f\u6d88\u606f\uff0c\u518d\u5207\u6362\u8d26\u53f7" });
+  const desktop = await inspectDesktopProcesses();
+  const desktopActivity = await inspectDesktopActivity(desktop);
+  if (desktopActivity.running) return res.status(409).json({ error: "\u684c\u9762 Codex \u6709\u4efb\u52a1\u6b63\u5728\u8fd0\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u5207\u6362\u8d26\u53f7", code: "DESKTOP_BUSY", activity: desktopActivity });
   transition = true;
-  setTakeoverState("switching-account", "正在切换账号并重启 Web Codex 服务…");
+  setTakeoverState("switching-account", "\u6b63\u5728\u5207\u6362\u8d26\u53f7\u5e76\u91cd\u542f Web Codex \u670d\u52a1\u2026", desktop.processes || []);
   broadcastState();
   try {
-    await codex.stop();
+    await codex.stop().catch(() => {});
+    if (desktop.running) {
+      const closed = await closeDesktop(false, false, desktop);
+      if (!closed.closed) throw httpError(409, "\u684c\u9762 Codex \u6682\u65f6\u65e0\u6cd5\u81ea\u52a8\u5173\u95ed\uff0c\u8bf7\u624b\u52a8\u5173\u95ed\u540e\u518d\u5207\u6362\u8d26\u53f7");
+    }
     const result = await runAccountSwitcher(["--account-switch-activate", profileId]);
     accountUsageSnapshot = null;
     const previousAccountKey = accountUsageHistory.activeKey;
@@ -425,18 +435,17 @@ app.post("/api/accounts/activate", requireAuth, requireWebMode, requireControlle
       atomicJson(accountUsageHistoryFile, accountUsageHistory),
     ]);
     await codex.start();
-    setTakeoverState("ready", "账号已切换，Web Codex 已重新连接");
+    setTakeoverState("ready", "\u8d26\u53f7\u5df2\u5207\u6362\uff0cWeb Codex \u5df2\u91cd\u65b0\u8fde\u63a5");
     await recordControlAudit("account-switched", req, { profileId });
     res.json({ ok: true, profile: result.profile || null, reconnectAfterMs: 4500 });
   } catch (error) {
-    setTakeoverState("failed", error.message || "账号切换失败");
+    setTakeoverState("failed", error.message || "\u8d26\u53f7\u5207\u6362\u5931\u8d25");
     throw error;
   } finally {
     transition = false;
     broadcastState();
   }
 }));
-
 app.post("/api/account/rate-limit-reset", requireAuth, requireWebMode, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
   if (resetCreditInFlight) return res.status(409).json({ error: "额度重置正在处理中，请勿重复提交" });
   resetCreditInFlight = true;
@@ -544,8 +553,8 @@ app.post("/api/uploads", requireAuth, requireSameOrigin, express.raw({ type: "ap
   const originalName = sanitizeFileName(safeDecodeURIComponent(String(req.query.name || "attachment")));
   const mime = String(req.query.type || "application/octet-stream").slice(0, 120);
   const isImage = ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime);
-  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: "空文件" });
-  if (!isImage && /\.(exe|dll|msi|bat|cmd|com|scr|ps1)$/i.test(originalName)) return res.status(400).json({ error: "不允许上传可执行文件" });
+  if (!Buffer.isBuffer(req.body)) return res.status(400).json({ error: "\u65e0\u6cd5\u8bfb\u53d6\u4e0a\u4f20\u5185\u5bb9" });
+  if (!isImage && /\.(exe|dll|msi|bat|cmd|com|scr|ps1)$/i.test(originalName)) return res.status(400).json({ error: "\u4e0d\u5141\u8bb8\u4e0a\u4f20\u53ef\u6267\u884c\u6587\u4ef6" });
   const id = crypto.randomUUID();
   const diskName = `${id}-${originalName}`;
   const filePath = path.join(uploadDir, diskName);
@@ -839,19 +848,18 @@ async function verifyThreadActive(threadId) {
 }
 
 async function buildInput(text, attachmentIds, ownerToken = "") {
-  if (text.length > 50_000) throw httpError(400, "消息过长");
+  if (text.length > 50_000) throw httpError(400, "\u6d88\u606f\u8fc7\u957f");
   const input = [];
   let message = text;
   for (const id of attachmentIds.slice(0, 10)) {
     const item = uploads.get(String(id));
-    if (!item || item.owner !== ownerToken) throw httpError(400, "附件已失效，请重新上传");
+    if (!item || item.owner !== ownerToken) throw httpError(400, "\u9644\u4ef6\u5df2\u5931\u6548\uff0c\u8bf7\u91cd\u65b0\u4e0a\u4f20");
     if (item.isImage) input.push({ type: "localImage", path: item.path });
-    else message += `${message ? "\n\n" : ""}附件：${item.name}\n本机路径：${item.path}\n请按用户要求读取此附件。`;
+    else message += `${message ? "\n\n" : ""}\u9644\u4ef6\uff1a${item.name}\n\u672c\u673a\u8def\u5f84\uff1a${item.path}\n\u8bf7\u6309\u7528\u6237\u8981\u6c42\u8bfb\u53d6\u6b64\u9644\u4ef6\u3002`;
   }
   if (message.trim()) input.unshift({ type: "text", text: message.trim() });
   return input;
 }
-
 async function saveQueues() { await atomicJson(queueFile, queues); }
 
 async function readThreadPreviews() {
@@ -1879,11 +1887,31 @@ function requireController(req, res, next) {
 }
 function requireSameOrigin(req, res, next) {
   const origin = req.headers.origin; const expectedHost = req.headers["x-forwarded-host"] || req.headers.host;
-  if (origin) { try { if (new URL(origin).host !== expectedHost) return res.status(403).json({ error: "来源校验失败" }); } catch { return res.status(403).json({ error: "来源校验失败" }); } }
+  if (origin) {
+    try {
+      const originHost = new URL(origin).host;
+      if (originHost !== expectedHost && !allowedPublicOriginHosts().has(originHost)) return res.status(403).json({ error: "来源校验失败" });
+    } catch { return res.status(403).json({ error: "来源校验失败" }); }
+  }
   next();
 }
 
-function cookieHeader(token, ageSeconds = Math.floor(sessionMs / 1000)) { return `codex_web_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${ageSeconds}${secureCookie ? "; Secure" : ""}`; }
+function allowedPublicOriginHosts() {
+  const hosts = new Set();
+  for (const value of String(process.env.CODEX_WEB_PUBLIC_URL || "").split(/[,\s]+/)) addUrlHost(hosts, value);
+  try {
+    const settings = JSON.parse(fs.readFileSync(launcherSettingsFile, "utf8"));
+    addUrlHost(hosts, settings.PublicUrl);
+  } catch { }
+  return hosts;
+}
+
+function addUrlHost(hosts, value) {
+  if (!value || typeof value !== "string") return;
+  try { hosts.add(new URL(value.trim()).host); } catch { }
+}
+
+function cookieHeader(token, ageSeconds = Math.floor(sessionMs / 1000)) { return `codex_web_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${ageSeconds}${secureCookie ? "; Secure" : ""}`; }
 function parseCookies(header) { return Object.fromEntries(header.split(";").map((part) => part.trim().split(/=(.*)/s).slice(0, 2)).filter(([key]) => key)); }
 function sessionKey(token) { return crypto.createHash("sha256").update(String(token || "")).digest("hex"); }
 async function saveSessions() { await atomicJson(sessionFile, Object.fromEntries(sessions)); }
