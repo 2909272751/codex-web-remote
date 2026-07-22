@@ -99,6 +99,23 @@ internal sealed class UpdateService : IDisposable
 
 internal static class UpdateApplier
 {
+    internal static ProcessStartInfo CreateSilentInstallerStartInfo(string setupPath, string installRoot)
+    {
+        var start = new ProcessStartInfo(setupPath)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = Path.GetDirectoryName(setupPath) ?? Environment.CurrentDirectory,
+        };
+        start.ArgumentList.Add("/VERYSILENT");
+        start.ArgumentList.Add("/SUPPRESSMSGBOXES");
+        start.ArgumentList.Add("/SP-");
+        start.ArgumentList.Add("/NORESTART");
+        start.ArgumentList.Add($"/DIR={installRoot}");
+        return start;
+    }
+
     public static int Run(string setupPath, string installRoot, int parentPid)
     {
         try
@@ -110,17 +127,19 @@ internal static class UpdateApplier
             }
             catch (ArgumentException) { }
 
-            var start = new ProcessStartInfo(setupPath) { UseShellExecute = false };
-            start.ArgumentList.Add("/VERYSILENT");
-            start.ArgumentList.Add("/SUPPRESSMSGBOXES");
-            start.ArgumentList.Add("/NORESTART");
-            start.ArgumentList.Add($"/DIR={installRoot}");
+            var start = CreateSilentInstallerStartInfo(setupPath, installRoot);
             using var installer = Process.Start(start) ?? throw new InvalidOperationException("无法启动更新安装包");
             installer.WaitForExit();
             if (installer.ExitCode != 0) return installer.ExitCode;
 
             var installedLauncher = Path.Combine(installRoot, "CodexWebRemote.exe");
-            var restart = new ProcessStartInfo(installedLauncher) { UseShellExecute = true };
+            var restart = new ProcessStartInfo(installedLauncher)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                WorkingDirectory = installRoot,
+            };
             restart.ArgumentList.Add("--background");
             Process.Start(restart);
             return 0;

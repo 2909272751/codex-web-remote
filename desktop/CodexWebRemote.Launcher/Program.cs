@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Threading;
 
 namespace CodexWebRemote;
@@ -82,6 +83,10 @@ internal static class Program
             if (!server.IsHealthyAsync(port).GetAwaiter().GetResult()) return 3;
             server.StopAsync().GetAwaiter().GetResult();
             if (!UpdateService.TryParseVersion("v99.8.7", out var updateVersion) || updateVersion != new Version(99, 8, 7)) return 4;
+            var silent = UpdateApplier.CreateSilentInstallerStartInfo("C:\\temp\\CodexWebRemote-Setup.exe", "D:\\CodexWebRemote");
+            if (silent.UseShellExecute || !silent.CreateNoWindow || silent.WindowStyle != ProcessWindowStyle.Hidden) return 5;
+            var requiredArgs = new[] { "/VERYSILENT", "/SUPPRESSMSGBOXES", "/SP-", "/NORESTART", "/DIR=D:\\CodexWebRemote" };
+            if (!requiredArgs.All(value => silent.ArgumentList.Contains(value))) return 6;
             return 0;
         }
         catch { return 1; }

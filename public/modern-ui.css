@@ -51,6 +51,7 @@ body { background-image: radial-gradient(circle at 92% -10%, color-mix(in srgb, 
 .messages { background: transparent; }
 .brand, .sidebar-section-title, .control-text, .chat-title, .message, .thread, .project-item, .account-button { color: var(--ui-text); }
 .muted, .message-meta, .sidebar-section-title, .chat-subtitle { color: var(--ui-muted); }
+.web-version { flex: 0 0 auto; margin-left: 4px; color: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 button, input, textarea, select { font: inherit; }
 button { transition: transform var(--ui-fast) ease, background-color var(--ui-fast) ease, border-color var(--ui-fast) ease, box-shadow var(--ui-fast) ease, color var(--ui-fast) ease; }

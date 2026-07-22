@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.4.7"
+    [string]$Version = "1.4.8"
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +19,11 @@ foreach ($target in @($publishDirectory, $portablePath, "$portablePath.sha256"))
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
 
-dotnet publish (Join-Path $ProjectDirectory "desktop\CodexWebRemote.Launcher\CodexWebRemote.Launcher.csproj") -c Release -r win-x64 --self-contained true -o $publishDirectory
+New-Item -ItemType Directory -Path $publishDirectory -Force | Out-Null
+$manifestPath = Join-Path $publishDirectory "CodexWebRemote.manifest"
+$manifestVersion = if ($Version -match '^\d+\.\d+\.\d+$') { "$Version.0" } else { "1.0.0.0" }
+(Get-Content (Join-Path $ProjectDirectory "desktop\CodexWebRemote.Launcher\app.manifest") -Raw).Replace('version="1.0.0.0"', "version=`"$manifestVersion`"") | Set-Content -LiteralPath $manifestPath -Encoding utf8
+dotnet publish (Join-Path $ProjectDirectory "desktop\CodexWebRemote.Launcher\CodexWebRemote.Launcher.csproj") -c Release -r win-x64 --self-contained true -p:Version=$Version -p:AssemblyVersion=$Version.0 -p:FileVersion=$Version.0 -p:ApplicationManifest=$manifestPath -o $publishDirectory
 if ($LASTEXITCODE -ne 0) { throw "Launcher publish failed: $LASTEXITCODE" }
 
 $pnpm = Get-Command pnpm.cmd -ErrorAction SilentlyContinue

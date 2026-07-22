@@ -59,11 +59,12 @@ window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener("change", 
 
 async function boot() {
   const session = await api("/api/session", { allow401: true });
+  setWebVersion(session?.version);
   if (!session?.authenticated) return showLogin();
   showApp(); connectEvents(); await refreshControl(); await restoreLastThread();
 }
 
-$("loginForm").addEventListener("submit", async (event) => { event.preventDefault(); $("loginError").textContent = ""; try { await api("/api/login", { method: "POST", body: { password: $("password").value } }); saveRememberedPassword(); showApp(); connectEvents(); await refreshControl(); } catch (error) { $("loginError").textContent = error.message; } });
+$("loginForm").addEventListener("submit", async (event) => { event.preventDefault(); $("loginError").textContent = ""; try { const login = await api("/api/login", { method: "POST", body: { password: $("password").value } }); setWebVersion(login?.version); saveRememberedPassword(); showApp(); connectEvents(); await refreshControl(); } catch (error) { $("loginError").textContent = error.message; } });
 $("logoutBtn").addEventListener("click", async () => { await api("/api/logout", { method: "POST" }); location.reload(); });
 $("accountMenuBtn").addEventListener("click", (event) => { event.stopPropagation(); toggleAccountMenu(); });
 $("usageMenuBtn").addEventListener("click", openUsage);
@@ -119,6 +120,7 @@ window.addEventListener("beforeunload", saveDraft);
 
 function showLogin() { restoreRememberedPassword(); $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden"); }
 function showApp() { $("loginView").classList.add("hidden"); $("appView").classList.remove("hidden"); }
+function setWebVersion(version) { const label = $("webVersion"); if (label) label.textContent = version ? `v${version}` : "v--"; }
 function restoreRememberedPassword() {
   try {
     const saved = localStorage.getItem(REMEMBER_PASSWORD_KEY) || "";
@@ -180,6 +182,7 @@ async function loadUpdateStatus() {
   state.updateLoaded = true;
   try {
     state.update = await api("/api/update/status");
+    setWebVersion(state.update.currentVersion);
     const available = Boolean(state.update.updateAvailable);
     $("updateBanner").classList.toggle("hidden", !available);
     if (!available) return;

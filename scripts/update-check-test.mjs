@@ -55,7 +55,7 @@ try {
   const cookie = login.headers.get("set-cookie")?.split(";")[0] || "";
   const response = await fetch(`http://127.0.0.1:${gatewayPort}/api/update/status`, { headers: { Cookie: cookie } });
   const status = await response.json();
-  if (!response.ok || !status.updateAvailable || status.latestVersion !== "99.0.0" || !status.updaterAvailable) throw new Error(`Unexpected update status: ${JSON.stringify(status)}`);
+  if (!response.ok || !status.currentVersion || !status.updateAvailable || status.latestVersion !== "99.0.0" || !status.updaterAvailable) throw new Error(`Unexpected update status: ${JSON.stringify(status)}`);
   console.log("UPDATE_CHECK_TEST_OK detected=true updater=true");
 } finally {
   child.kill();

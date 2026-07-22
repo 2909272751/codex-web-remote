@@ -167,7 +167,7 @@ try {
   await stopServer(child); child = null;
   child = await startServer();
   const draftRestartSession = await request("/api/session");
-  if (!draftRestartSession.authenticated) throw new Error("Session did not survive the empty-task recovery restart");
+  if (!draftRestartSession.authenticated || !draftRestartSession.version) throw new Error("Session did not preserve authentication and runtime version after restart");
   await request("/api/control/takeover", { method: "POST", body: {} });
   const draftsAfterRestart = await request("/api/threads");
   if (!draftsAfterRestart.data?.some((thread) => thread.id === emptyDraft.thread.id && thread.cwd === root)) {

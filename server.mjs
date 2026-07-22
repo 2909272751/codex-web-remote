@@ -148,7 +148,7 @@ app.post("/api/login", asyncRoute(async (req, res) => {
   sessions.set(sessionKey(token), { expiresAt: Date.now() + sessionMs });
   await saveSessions();
   res.setHeader("Set-Cookie", cookieHeader(token));
-  res.json({ ok: true });
+  res.json({ ok: true, version: currentVersion });
 }));
 
 app.post("/api/logout", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -161,7 +161,7 @@ app.post("/api/logout", requireAuth, requireSameOrigin, asyncRoute(async (req, r
 
 app.get("/api/session", (req, res) => {
   const session = getSession(req);
-  res.json({ authenticated: Boolean(session), codexReady: codex.ready, mode });
+  res.json({ authenticated: Boolean(session), codexReady: codex.ready, mode, version: currentVersion });
 });
 
 app.get("/api/control/status", requireAuth, asyncRoute(async (req, res) => {
