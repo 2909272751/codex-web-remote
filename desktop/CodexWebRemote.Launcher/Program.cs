@@ -25,6 +25,12 @@ internal static class Program
             Environment.ExitCode = RunSelfTest();
             return;
         }
+        if (args.Contains("--update-swap-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            var root = Path.Combine(Path.GetTempPath(), "CodexWebRemote.UpdateSwapTest", Guid.NewGuid().ToString("N"));
+            Environment.ExitCode = UpdateApplier.RunSwapSelfTest(root) ? 0 : 1;
+            return;
+        }
         if (args.Contains("--account-switch-list", StringComparer.OrdinalIgnoreCase) || args.Contains("--account-switch-activate", StringComparer.OrdinalIgnoreCase))
         {
             Environment.ExitCode = AccountSwitcher.Run(args);
@@ -83,10 +89,17 @@ internal static class Program
             if (!server.IsHealthyAsync(port).GetAwaiter().GetResult()) return 3;
             server.StopAsync().GetAwaiter().GetResult();
             if (!UpdateService.TryParseVersion("v99.8.7", out var updateVersion) || updateVersion != new Version(99, 8, 7)) return 4;
-            var silent = UpdateApplier.CreateSilentInstallerStartInfo("C:\\temp\\CodexWebRemote-Setup.exe", "D:\\CodexWebRemote");
-            if (silent.UseShellExecute || !silent.CreateNoWindow || silent.WindowStyle != ProcessWindowStyle.Hidden) return 5;
-            var requiredArgs = new[] { "/VERYSILENT", "/SUPPRESSMSGBOXES", "/SP-", "/NORESTART", "/DIR=D:\\CodexWebRemote" };
-            if (!requiredArgs.All(value => silent.ArgumentList.Contains(value))) return 6;
+            var payload = Path.Combine(stateRoot, "payload");
+            foreach (var relative in new[] { "CodexWebRemote.exe", "server.mjs", @"runtime\node.exe", @"node_modules\@openai\codex\bin\codex.js", @"public\manifest.webmanifest" })
+            {
+                var file = Path.Combine(payload, relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+                File.WriteAllText(file, "self-test");
+            }
+            if (!UpdateApplier.ValidatePayload(payload)) return 5;
+            File.Delete(Path.Combine(payload, "server.mjs"));
+            if (UpdateApplier.ValidatePayload(payload)) return 6;
+            if (!UpdateApplier.RunSwapSelfTest(Path.Combine(stateRoot, "swap-test"))) return 7;
             return 0;
         }
         catch { return 1; }

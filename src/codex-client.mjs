@@ -1,11 +1,13 @@
 import { EventEmitter } from "node:events";
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, "..");
+const appVersion = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8")).version || "0.0.0";
 const codexEntry = path.join(projectRoot, "node_modules", "@openai", "codex", "bin", "codex.js");
 const codexProfile = process.env.CODEX_WEB_CODEX_PROFILE || "";
 const playwrightMcpEntry = path.join(projectRoot, "node_modules", "@playwright", "mcp", "cli.js");
@@ -13,6 +15,8 @@ const runtimeDataRoot = process.env.CODEX_WEB_DATA_DIR ? path.resolve(process.en
 const playwrightOutputDir = path.join(runtimeDataRoot, "playwright-output");
 const playwrightProfileDir = path.join(runtimeDataRoot, "playwright-profile");
 const enableBrowserMcp = process.env.CODEX_WEB_BROWSER_MCP !== "0";
+const isolateBrowserMcp = process.env.CODEX_WEB_BROWSER_ISOLATED !== "0";
+const requiredBrowserTools = ["browser_navigate", "browser_snapshot", "browser_take_screenshot"];
 
 export class CodexClient extends EventEmitter {
   constructor() {
@@ -23,6 +27,16 @@ export class CodexClient extends EventEmitter {
     this.serverRequests = new Map();
     this.ready = false;
     this.stderrTail = [];
+    this.browserStatus = {
+      configured: enableBrowserMcp,
+      ready: false,
+      verified: false,
+      server: "playwright",
+      tools: [],
+      missingTools: [...requiredBrowserTools],
+      message: enableBrowserMcp ? "浏览器后端尚未启动" : "浏览器后端已在配置中禁用",
+      checkedAt: 0,
+    };
   }
 
   async start() {
@@ -32,7 +46,8 @@ export class CodexClient extends EventEmitter {
       playwrightMcpEntry,
       "--browser", "msedge",
       "--headless",
-      "--user-data-dir", playwrightProfileDir,
+      ...(isolateBrowserMcp ? ["--isolated"] : []),
+      ...(!isolateBrowserMcp ? ["--user-data-dir", playwrightProfileDir] : []),
       "--output-dir", playwrightOutputDir,
       "--output-max-size", "104857600",
       "--viewport-size", "1280x800",
@@ -66,6 +81,13 @@ export class CodexClient extends EventEmitter {
       this.pending.clear();
       this.serverRequests.clear();
       this.ready = false;
+      this.browserStatus = {
+        ...this.browserStatus,
+        ready: false,
+        verified: false,
+        message: "Codex 后端已停止，浏览器后端不可用",
+        checkedAt: Date.now(),
+      };
       this.child = null;
       this.emit("status", { ready: false, error: error.message });
     });
@@ -84,14 +106,65 @@ export class CodexClient extends EventEmitter {
       clientInfo: {
         name: "codex_web_remote",
         title: "Codex Web Remote",
-        version: "1.4.3",
+        version: appVersion,
       },
       capabilities: { experimentalApi: true },
     });
     this.notify("initialized", {});
     this.ready = true;
-    this.emit("status", { ready: true, initialized });
+    await this.refreshBrowserStatus();
+    this.emit("status", { ready: true, initialized, browser: this.getBrowserStatus() });
     return initialized;
+  }
+
+  getBrowserStatus() {
+    return {
+      ...this.browserStatus,
+      tools: [...this.browserStatus.tools],
+      missingTools: [...this.browserStatus.missingTools],
+    };
+  }
+
+  async refreshBrowserStatus() {
+    const checkedAt = Date.now();
+    if (!enableBrowserMcp) {
+      this.browserStatus = {
+        configured: false,
+        ready: false,
+        verified: false,
+        server: "playwright",
+        tools: [],
+        missingTools: [...requiredBrowserTools],
+        message: "浏览器后端已在配置中禁用",
+        checkedAt,
+      };
+      return this.getBrowserStatus();
+    }
+    if (!this.ready) {
+      this.browserStatus = {
+        ...this.browserStatus,
+        ready: false,
+        message: "Codex 后端尚未就绪",
+        checkedAt,
+      };
+      return this.getBrowserStatus();
+    }
+    // Enumerating MCP tools or running a probe eagerly opens a second
+    // Playwright connection in some Codex versions. With a persistent Edge
+    // profile that can lock the profile before the real browser turn starts.
+    // Keep startup side-effect free; the first real browser tool call verifies
+    // the session and is surfaced to the Web UI.
+    this.browserStatus = {
+      ...this.browserStatus,
+      configured: true,
+      ready: true,
+      verified: false,
+      tools: [...requiredBrowserTools],
+      missingTools: [],
+      message: "独立 Edge 浏览器已配置，首次网页操作时验证",
+      checkedAt,
+    };
+    return this.getBrowserStatus();
   }
 
   request(method, params = {}) {

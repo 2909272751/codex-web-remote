@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Net;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -6,8 +7,8 @@ using System.Text.Json;
 
 namespace CodexWebRemote;
 
-internal sealed record ReleaseInfo(string TagName, Version Version, string PageUrl, string SetupUrl, string HashUrl);
-internal sealed record PreparedUpdate(string SetupPath, string HelperPath, ReleaseInfo Release);
+internal sealed record ReleaseInfo(string TagName, Version Version, string PageUrl, string PackageUrl, string HashUrl);
+internal sealed record PreparedUpdate(string StagingPath, string HelperPath, ReleaseInfo Release);
 
 internal sealed class UpdateService : IDisposable
 {
@@ -21,7 +22,7 @@ internal sealed class UpdateService : IDisposable
     public UpdateService(AppPaths paths)
     {
         _paths = paths;
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("CodexWebRemote-Updater/1.0");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("CodexWebRemote-Updater/2.0");
         _http.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
     }
 
@@ -40,15 +41,17 @@ internal sealed class UpdateService : IDisposable
         var tag = root.GetProperty("tag_name").GetString() ?? "";
         if (!TryParseVersion(tag, out var version)) return null;
         var page = root.TryGetProperty("html_url", out var pageElement) ? pageElement.GetString() ?? "" : "";
-        string setup = "", hash = "";
+        string package = "", hash = "";
         foreach (var asset in root.GetProperty("assets").EnumerateArray())
         {
             var name = asset.GetProperty("name").GetString() ?? "";
             var url = asset.GetProperty("browser_download_url").GetString() ?? "";
-            if (name.EndsWith("-win-x64.exe", StringComparison.OrdinalIgnoreCase) && name.Contains("Setup", StringComparison.OrdinalIgnoreCase)) setup = url;
-            if (name.EndsWith("-win-x64.exe.sha256", StringComparison.OrdinalIgnoreCase) && name.Contains("Setup", StringComparison.OrdinalIgnoreCase)) hash = url;
+            if (name.EndsWith("-win-x64.zip", StringComparison.OrdinalIgnoreCase) && name.Contains("Portable", StringComparison.OrdinalIgnoreCase)) package = url;
+            if (name.EndsWith("-win-x64.zip.sha256", StringComparison.OrdinalIgnoreCase) && name.Contains("Portable", StringComparison.OrdinalIgnoreCase)) hash = url;
         }
-        return string.IsNullOrWhiteSpace(setup) || string.IsNullOrWhiteSpace(hash) ? null : new ReleaseInfo(tag, version, page, setup, hash);
+        return string.IsNullOrWhiteSpace(package) || string.IsNullOrWhiteSpace(hash)
+            ? null
+            : new ReleaseInfo(tag, version, page, package, hash);
     }
 
     private async Task<ReleaseInfo?> CheckFromPublicReleasePageAsync(CancellationToken cancellationToken)
@@ -61,9 +64,8 @@ internal sealed class UpdateService : IDisposable
         if (!TryParseVersion(tag, out var version)) return null;
         var normalizedTag = tag.Trim();
         var baseUrl = $"https://github.com/2909272751/codex-web-remote/releases/download/{normalizedTag}";
-        var setup = $"{baseUrl}/CodexWebRemote-Setup-{version}-win-x64.exe";
-        var hash = $"{setup}.sha256";
-        return new ReleaseInfo(normalizedTag, version, page, setup, hash);
+        var package = $"{baseUrl}/CodexWebRemote-Portable-{version}-win-x64.zip";
+        return new ReleaseInfo(normalizedTag, version, page, package, $"{package}.sha256");
     }
 
     public bool IsNewer(ReleaseInfo release) => release.Version > CurrentVersion;
@@ -71,9 +73,10 @@ internal sealed class UpdateService : IDisposable
     public async Task<PreparedUpdate> DownloadAsync(ReleaseInfo release, IProgress<int>? progress = null, CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(_paths.UpdatesRoot);
-        var setupPath = Path.Combine(_paths.UpdatesRoot, $"CodexWebRemote-Setup-{release.Version}-win-x64.exe");
-        var tempPath = setupPath + ".download";
-        using (var response = await _http.GetAsync(release.SetupUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+        CleanupOldDownloads();
+        var archivePath = Path.Combine(_paths.UpdatesRoot, $"CodexWebRemote-Portable-{release.Version}-win-x64.zip");
+        var tempPath = archivePath + ".download";
+        using (var response = await _http.GetAsync(release.PackageUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
         {
             response.EnsureSuccessStatusCode();
             var total = response.Content.Headers.ContentLength;
@@ -90,21 +93,52 @@ internal sealed class UpdateService : IDisposable
                 if (total > 0) progress?.Report((int)Math.Clamp(copied * 100 / total.Value, 0, 100));
             }
         }
-        File.Move(tempPath, setupPath, true);
+        File.Move(tempPath, archivePath, true);
         var hashText = await _http.GetStringAsync(release.HashUrl, cancellationToken);
         var expected = hashText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-        await using (var file = File.OpenRead(setupPath))
+        await using (var file = File.OpenRead(archivePath))
         {
             var actual = Convert.ToHexString(await SHA256.HashDataAsync(file, cancellationToken));
             if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase))
             {
-                File.Delete(setupPath);
-                throw new InvalidDataException("更新包 SHA256 校验失败，已取消安装。");
+                File.Delete(archivePath);
+                throw new InvalidDataException("更新包 SHA256 校验失败，已取消更新。");
             }
         }
-        var helperPath = Path.Combine(_paths.UpdatesRoot, "CodexWebRemote.Updater.exe");
-        File.Copy(_paths.ExecutablePath, helperPath, true);
-        return new PreparedUpdate(setupPath, helperPath, release);
+
+        var installParent = Directory.GetParent(_paths.AppRoot)?.FullName
+            ?? throw new InvalidOperationException("无法确定程序安装目录。");
+        var stagingContainer = Path.Combine(installParent, $"{Path.GetFileName(_paths.AppRoot)}.update-{release.Version}-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(stagingContainer);
+        try
+        {
+            ZipFile.ExtractToDirectory(archivePath, stagingContainer, true);
+            var stagingPath = ResolvePayloadRoot(stagingContainer);
+            if (!UpdateApplier.ValidatePayload(stagingPath)) throw new InvalidDataException("更新包内容不完整，已取消更新。");
+            var helperPath = Path.Combine(_paths.UpdatesRoot, "CodexWebRemote.Updater.exe");
+            File.Copy(_paths.ExecutablePath, helperPath, true);
+            return new PreparedUpdate(stagingPath, helperPath, release);
+        }
+        catch
+        {
+            try { Directory.Delete(stagingContainer, true); } catch { }
+            throw;
+        }
+    }
+
+    private static string ResolvePayloadRoot(string stagingContainer)
+    {
+        if (UpdateApplier.ValidatePayload(stagingContainer)) return stagingContainer;
+        var directories = Directory.GetDirectories(stagingContainer);
+        return directories.Length == 1 && UpdateApplier.ValidatePayload(directories[0]) ? directories[0] : stagingContainer;
+    }
+
+    private void CleanupOldDownloads()
+    {
+        foreach (var file in Directory.GetFiles(_paths.UpdatesRoot, "CodexWebRemote-Portable-*-win-x64.zip*"))
+        {
+            try { File.Delete(file); } catch { }
+        }
     }
 
     internal static bool TryParseVersion(string tag, out Version version)
@@ -118,25 +152,58 @@ internal sealed class UpdateService : IDisposable
 
 internal static class UpdateApplier
 {
-    internal static ProcessStartInfo CreateSilentInstallerStartInfo(string setupPath, string installRoot)
+    private static readonly string[] RequiredPayloadFiles =
     {
-        var start = new ProcessStartInfo(setupPath)
+        "CodexWebRemote.exe",
+        "server.mjs",
+        @"runtime\node.exe",
+        @"node_modules\@openai\codex\bin\codex.js",
+        @"public\manifest.webmanifest",
+    };
+
+    internal static bool ValidatePayload(string root) =>
+        !string.IsNullOrWhiteSpace(root) && Directory.Exists(root) &&
+        RequiredPayloadFiles.All(relative => File.Exists(Path.Combine(root, relative)));
+
+    internal static bool RunSwapSelfTest(string root)
+    {
+        try
         {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WindowStyle = ProcessWindowStyle.Hidden,
-            WorkingDirectory = Path.GetDirectoryName(setupPath) ?? Environment.CurrentDirectory,
-        };
-        start.ArgumentList.Add("/VERYSILENT");
-        start.ArgumentList.Add("/SUPPRESSMSGBOXES");
-        start.ArgumentList.Add("/SP-");
-        start.ArgumentList.Add("/NORESTART");
-        start.ArgumentList.Add($"/DIR={installRoot}");
-        return start;
+            var installRoot = Path.Combine(root, "CodexWebRemote");
+            var stagingRoot = Path.Combine(root, "CodexWebRemote.update-self-test");
+            var backupRoot = installRoot + ".previous";
+            Directory.CreateDirectory(installRoot);
+            File.WriteAllText(Path.Combine(installRoot, "obsolete-file.txt"), "old");
+            foreach (var relative in RequiredPayloadFiles)
+            {
+                var file = Path.Combine(stagingRoot, relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+                File.WriteAllText(file, "new");
+            }
+            File.WriteAllText(Path.Combine(stagingRoot, "new-file.txt"), "new");
+            MoveDirectoryWithRetry(installRoot, backupRoot);
+            MoveDirectoryWithRetry(stagingRoot, installRoot);
+            var valid = ValidatePayload(installRoot) &&
+                File.Exists(Path.Combine(installRoot, "new-file.txt")) &&
+                !File.Exists(Path.Combine(installRoot, "obsolete-file.txt")) &&
+                Directory.Exists(backupRoot);
+            DeleteDirectoryWithRetry(backupRoot);
+            DeleteDirectoryWithRetry(installRoot);
+            DeleteDirectoryWithRetry(root);
+            return valid && !Directory.Exists(root);
+        }
+        catch
+        {
+            try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { }
+            return false;
+        }
     }
 
-    public static int Run(string setupPath, string installRoot, int parentPid)
+    public static int Run(string stagingPath, string installRoot, int parentPid)
     {
+        var backupRoot = installRoot.TrimEnd(Path.DirectorySeparatorChar) + ".previous";
+        var stagingContainer = FindStagingContainer(stagingPath, installRoot);
+        var movedOldInstall = false;
         try
         {
             try
@@ -146,23 +213,135 @@ internal static class UpdateApplier
             }
             catch (ArgumentException) { }
 
-            var start = CreateSilentInstallerStartInfo(setupPath, installRoot);
-            using var installer = Process.Start(start) ?? throw new InvalidOperationException("无法启动更新安装包");
-            installer.WaitForExit();
-            if (installer.ExitCode != 0) return installer.ExitCode;
+            if (!ValidatePayload(stagingPath)) throw new InvalidDataException("更新暂存目录内容不完整。");
+            PreserveUninstaller(installRoot, stagingPath);
+            if (Directory.Exists(backupRoot)) Directory.Delete(backupRoot, true);
+            MoveDirectoryWithRetry(installRoot, backupRoot);
+            movedOldInstall = true;
+            MoveDirectoryWithRetry(stagingPath, installRoot);
 
             var installedLauncher = Path.Combine(installRoot, "CodexWebRemote.exe");
-            var restart = new ProcessStartInfo(installedLauncher)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                WorkingDirectory = installRoot,
-            };
-            restart.ArgumentList.Add("--background");
-            Process.Start(restart);
+            using var selfTest = Process.Start(CreateLauncherStartInfo(installedLauncher, "--self-test"))
+                ?? throw new InvalidOperationException("无法验证更新后的程序。");
+            if (!selfTest.WaitForExit(120_000) || selfTest.ExitCode != 0)
+                throw new InvalidOperationException("更新后的程序自检失败。");
+
+            Process.Start(CreateLauncherStartInfo(installedLauncher, "--background"));
+            try { DeleteDirectoryWithRetry(backupRoot); } catch { }
+            CleanupStagingContainer(stagingContainer, installRoot);
+            CleanupUpdateDownloads();
             return 0;
         }
-        catch { return 1; }
+        catch
+        {
+            try
+            {
+                if (movedOldInstall && Directory.Exists(backupRoot))
+                {
+                    if (Directory.Exists(installRoot)) DeleteDirectoryWithRetry(installRoot);
+                    MoveDirectoryWithRetry(backupRoot, installRoot);
+                }
+                var launcher = Path.Combine(installRoot, "CodexWebRemote.exe");
+                if (File.Exists(launcher)) Process.Start(CreateLauncherStartInfo(launcher, "--background"));
+            }
+            catch { }
+            return 1;
+        }
+    }
+
+    private static ProcessStartInfo CreateLauncherStartInfo(string executable, string argument)
+    {
+        var start = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = Path.GetDirectoryName(executable) ?? Environment.CurrentDirectory,
+        };
+        start.ArgumentList.Add(argument);
+        start.Environment["CODEX_WEB_SELF_TEST_PORT"] = Random.Shared.Next(19000, 24000).ToString();
+        return start;
+    }
+
+    private static void PreserveUninstaller(string installRoot, string stagingPath)
+    {
+        if (!Directory.Exists(installRoot)) return;
+        foreach (var pattern in new[] { "unins*.exe", "unins*.dat", "unins*.msg" })
+            foreach (var file in Directory.GetFiles(installRoot, pattern, SearchOption.TopDirectoryOnly))
+                File.Copy(file, Path.Combine(stagingPath, Path.GetFileName(file)), true);
+    }
+
+    private static void CleanupStagingContainer(string? stagingContainer, string installRoot)
+    {
+        if (string.IsNullOrWhiteSpace(stagingContainer) || !Directory.Exists(stagingContainer)) return;
+        var installParent = Directory.GetParent(Path.GetFullPath(installRoot))?.FullName;
+        var stagingParent = Directory.GetParent(Path.GetFullPath(stagingContainer))?.FullName;
+        var expectedPrefix = Path.GetFileName(installRoot) + ".update-";
+        if (!string.Equals(installParent, stagingParent, StringComparison.OrdinalIgnoreCase) ||
+            !Path.GetFileName(stagingContainer).StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase)) return;
+        try { DeleteDirectoryWithRetry(stagingContainer); } catch { }
+    }
+
+    private static string? FindStagingContainer(string stagingPath, string installRoot)
+    {
+        var expectedPrefix = Path.GetFileName(installRoot) + ".update-";
+        var installParent = Directory.GetParent(Path.GetFullPath(installRoot))?.FullName;
+        for (var current = new DirectoryInfo(Path.GetFullPath(stagingPath)); current is not null; current = current.Parent)
+        {
+            if (string.Equals(current.Parent?.FullName, installParent, StringComparison.OrdinalIgnoreCase) &&
+                current.Name.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase)) return current.FullName;
+            if (string.Equals(current.FullName, installParent, StringComparison.OrdinalIgnoreCase)) break;
+        }
+        return null;
+    }
+
+    private static void CleanupUpdateDownloads()
+    {
+        try
+        {
+            var updatesRoot = AppContext.BaseDirectory;
+            foreach (var file in Directory.GetFiles(updatesRoot, "CodexWebRemote-Portable-*-win-x64.zip*"))
+                try { File.Delete(file); } catch { }
+        }
+        catch { }
+    }
+
+    private static void MoveDirectoryWithRetry(string source, string destination)
+    {
+        Exception? last = null;
+        for (var attempt = 1; attempt <= 12; attempt++)
+        {
+            try
+            {
+                Directory.Move(source, destination);
+                return;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                last = error;
+                Thread.Sleep(attempt * 250);
+            }
+        }
+        throw last ?? new IOException($"无法替换目录：{source}");
+    }
+
+    private static void DeleteDirectoryWithRetry(string path)
+    {
+        if (!Directory.Exists(path)) return;
+        Exception? last = null;
+        for (var attempt = 1; attempt <= 12; attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, true);
+                return;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                last = error;
+                Thread.Sleep(attempt * 250);
+            }
+        }
+        throw last ?? new IOException($"无法清理目录：{path}");
     }
 }

@@ -196,7 +196,7 @@ async function loadUpdateStatus({ force = false } = {}) {
     $("updateBanner").classList.toggle("hidden", !available);
     if (!available) return;
     $("updateTitle").textContent = `发现新版本 v${state.update.latestVersion}`;
-    $("updateDetail").textContent = `当前 v${state.update.currentVersion}；更新会短暂重启服务，设置和数据都会保留。`;
+    $("updateDetail").textContent = `当前 v${state.update.currentVersion}；更新会在后台校验并无感替换文件，服务仅短暂重启。`;
     $("updateReleaseLink").href = state.update.releaseUrl || "#";
     $("updateNowBtn").disabled = !state.update.updaterAvailable || state.control?.mode !== "web";
     $("updateNowBtn").textContent = state.update.updaterAvailable ? "立即更新" : "请在主机更新";
@@ -207,7 +207,7 @@ async function loadUpdateStatus({ force = false } = {}) {
 
 async function applyHostUpdate() {
   if (!state.update?.updateAvailable) return;
-  if (!confirm(`更新到 v${state.update.latestVersion}？下载完成后服务会短暂断开并自动恢复。`)) return;
+  if (!confirm(`无感更新到 v${state.update.latestVersion}？更新包校验完成后，服务会短暂断开并自动恢复，不会弹出安装窗口。`)) return;
   const button = $("updateNowBtn");
   button.disabled = true;
   button.textContent = "正在准备…";
@@ -240,7 +240,8 @@ function renderControl() {
   const activeCount = Object.keys(c.activeTurns || {}).length;
   const queuedCount = Number(c.queuedCount || 0);
   const clientCount = Number(c.webClientCount || 0);
-  $("controlMeta").textContent = c.mode === "web" ? `共享控制 · ${Math.max(1, clientCount)} 个 Web 端在线${activeCount ? ` · ${activeCount} 个任务运行中` : ""}${queuedCount ? ` · ${queuedCount} 条排队` : ""}` : (c.desktopRunning ? `${c.desktopProcesses?.length || 0} 个桌面进程 · 仅可只读浏览` : "可安全接管");
+  const browserMeta = c.browser?.verified ? "浏览器：正在使用" : (c.browser?.configured ? "浏览器：已配置" : (c.browser?.message ? `浏览器：${c.browser.message}` : "浏览器：等待接管"));
+  $("controlMeta").textContent = c.mode === "web" ? `共享控制 · ${Math.max(1, clientCount)} 个 Web 端在线 · ${browserMeta}${activeCount ? ` · ${activeCount} 个任务运行中` : ""}${queuedCount ? ` · ${queuedCount} 条排队` : ""}` : (c.desktopRunning ? `${c.desktopProcesses?.length || 0} 个桌面进程 · 仅可只读浏览` : "可安全接管");
   if (state.update?.updateAvailable) $("updateNowBtn").disabled = !state.update.updaterAvailable || c.mode !== "web";
   const labels = { desktop: "桌面 App 正在使用；接管后会正常关闭桌面 App", available: "桌面 App 未运行，可以接管", web: "Web 共享控制已开启，可在多个设备同时使用" };
   $("controlText").textContent = c.transition ? (c.takeoverState?.message || "正在切换…") : (c.takeoverState?.phase === "failed" ? `接管失败：${c.takeoverState.message}` : (labels[c.mode] || c.mode));

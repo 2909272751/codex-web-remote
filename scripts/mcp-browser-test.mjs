@@ -1,8 +1,30 @@
 import http from "node:http";
+import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { CodexClient } from "../src/codex-client.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
+const testDataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-web-browser-test-"));
+process.env.CODEX_WEB_DATA_DIR = testDataDir;
+const { CodexClient } = await import("../src/codex-client.mjs");
+
+async function removeTestData() {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      await fsp.rm(testDataDir, { recursive: true, force: true, maxRetries: 1, retryDelay: 150 });
+      return;
+    } catch (error) {
+      if (attempt === 11) {
+        // Edge can keep Crashpad metadata open briefly after its MCP parent
+        // exits. Leaving an OS-managed temporary folder is preferable to
+        // turning a passed browser test into a false failure.
+        console.warn(`Could not remove temporary browser profile: ${error.code || error.message}`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+}
 const pageServer = http.createServer((request, response) => {
   response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   response.end("<!doctype html><title>Playwright MCP QA</title><h1>PLAYWRIGHT_NAV_OK</h1><button onclick=\"document.querySelector('h1').textContent='PLAYWRIGHT_CLICK_OK'\">测试点击</button>");
@@ -17,12 +39,13 @@ const address = pageServer.address();
 const url = `http://127.0.0.1:${address.port}/`;
 const client = new CodexClient();
 let stderr = "";
+let threadId = "";
 client.on("stderr", (chunk) => { stderr += String(chunk); });
 
 try {
   await client.start();
   const started = await client.request("thread/start", { cwd: root, ephemeral: true, approvalPolicy: "never", sandbox: "danger-full-access" });
-  const threadId = started.thread.id;
+  threadId = started.thread.id;
   await client.request("mcpServer/tool/call", { server: "playwright", tool: "browser_navigate", threadId, arguments: { url } });
   const snapshot = await client.request("mcpServer/tool/call", { server: "playwright", tool: "browser_snapshot", threadId, arguments: {} });
   const snapshotText = JSON.stringify(snapshot);
@@ -39,6 +62,11 @@ try {
   if (stderr.trim()) console.error(stderr.trim());
   throw error;
 } finally {
+  if (threadId) {
+    try { await client.request("mcpServer/tool/call", { server: "playwright", tool: "browser_close", threadId, arguments: {} }); }
+    catch { }
+  }
   await client.stop();
   await new Promise((resolve) => pageServer.close(resolve));
+  await removeTestData();
 }

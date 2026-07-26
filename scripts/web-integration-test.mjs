@@ -134,6 +134,10 @@ try {
   const persistedSessions = await fsp.readFile(path.join(temp, "data", "sessions.json"), "utf8");
   if (persistedSessions.includes(cookie.split("=")[1])) throw new Error("Raw session token was persisted");
   await request("/api/control/takeover", { method: "POST", body: {} });
+  const controlledStatus = await request("/api/control/status");
+  if (!controlledStatus.browser?.ready || !controlledStatus.browser.tools?.includes("browser_navigate")) {
+    throw new Error(`Takeover reported ready before the Web browser backend was available: ${JSON.stringify(controlledStatus.browser)}`);
+  }
   const primaryCookie = cookie;
   await request("/api/login", { method: "POST", body: { password } });
   secondaryCookie = cookie;

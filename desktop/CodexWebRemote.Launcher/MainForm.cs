@@ -320,6 +320,7 @@ internal sealed class MainForm : Form
             });
             var prepared = await _updates.DownloadAsync(release, progress);
             if (_updateStatus is not null) _updateStatus.Text = "更新包校验通过，正在重启安装…";
+            if (_updateStatus is not null) _updateStatus.Text = "更新包校验通过，正在无感替换文件…";
             var helper = new ProcessStartInfo(prepared.HelperPath)
             {
                 UseShellExecute = false,
@@ -328,7 +329,7 @@ internal sealed class MainForm : Form
                 WorkingDirectory = Path.GetDirectoryName(prepared.HelperPath) ?? _paths.UpdatesRoot,
             };
             helper.ArgumentList.Add("--apply-update");
-            helper.ArgumentList.Add(prepared.SetupPath);
+            helper.ArgumentList.Add(prepared.StagingPath);
             helper.ArgumentList.Add(_paths.AppRoot);
             helper.ArgumentList.Add(Environment.ProcessId.ToString());
             Process.Start(helper);

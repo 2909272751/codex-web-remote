@@ -101,6 +101,7 @@ let fullAccess = defaultFullAccess;
 let mode = "desktop";
 let transition = false;
 let takeoverState = { phase: "idle", message: "", startedAt: 0, updatedAt: Date.now(), processes: [] };
+let browserState = codex.getBrowserStatus();
 let lastThreadId = null;
 let resetCreditInFlight = false;
 let updateCache = null;
@@ -116,6 +117,13 @@ const eventBuffer = [];
 const eventBufferLimit = 1_000;
 const atomicJsonWrites = new Map();
 const resolvedSessionRoot = path.resolve(sessionRoot);
+const browserGuidedThreads = new Set();
+const browserDeveloperInstructions = [
+  "当前任务运行在 Codex Web Remote。网页操作由独立的 Playwright Edge 浏览器提供。",
+  "当需要打开网页、搜索、登录、点击、输入、截图或上传网站文件时，优先调用 MCP server `playwright` 的 `browser_*` 工具。",
+  "不要寻找或声称缺少桌面 App 专属的内置 Browser/Computer Use 窗口；本任务可用的是独立的 Playwright 浏览器会话。",
+  "若遇到验证码、多因素验证或必须由用户确认的提交，先通过页面快照或截图说明当前状态，再向用户请求下一步操作。",
+].join("\n");
 
 setInterval(cleanup, 60_000).unref();
 setInterval(() => broadcast({ type: "heartbeat", data: { at: Date.now() } }, false), 15_000).unref();
@@ -165,13 +173,13 @@ app.post("/api/logout", requireAuth, requireSameOrigin, asyncRoute(async (req, r
 
 app.get("/api/session", (req, res) => {
   const session = getSession(req);
-  res.json({ authenticated: Boolean(session), codexReady: codex.ready, mode, version: currentVersion });
+  res.json({ authenticated: Boolean(session), codexReady: codex.ready, mode, browser: publicBrowserState(), version: currentVersion });
 });
 
 app.get("/api/control/status", requireAuth, asyncRoute(async (req, res) => {
   const desktop = await inspectDesktopProcesses();
   res.json({
-    mode, transition, takeoverState, fullAccess, terminal: terminal.status(), desktopRunning: desktop.running, desktopProcesses: desktop.processes, codexReady: codex.ready,
+    mode, transition, takeoverState, fullAccess, terminal: terminal.status(), desktopRunning: desktop.running, desktopProcesses: desktop.processes, codexReady: codex.ready, browser: publicBrowserState(),
     controller: mode === "web" || (mode === "terminal" && terminalControllerToken === req.sessionToken),
     controllerBusy: mode === "terminal" && Boolean(terminalControllerToken && terminalControllerToken !== req.sessionToken),
     sharedWebControl: mode === "web",
@@ -208,6 +216,9 @@ app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(asy
     await closeDesktop(true, true, desktop);
     setTakeoverState("starting", "正在启动 Web Codex 后端");
     await codex.start();
+    setTakeoverState("browser", "正在验证 Web 浏览器工具");
+    const browser = await refreshBrowserState();
+    if (!browser.configured) throw new Error(`Web 浏览器不可用：${browser.message}`);
     setTakeoverState("verifying", "正在验证任务列表");
     const probe = await codex.request("thread/list", { limit: 1, sortKey: "recency_at", sortDirection: "desc", archived: false, modelProviders: [], sourceKinds: null });
     if (!probe || !Array.isArray(probe.data)) throw new Error("Codex 后端健康检查失败");
@@ -217,6 +228,7 @@ app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(asy
     await recordControlAudit("takeover-completed", req);
     res.json({ ok: true });
   } catch (error) {
+    if (codex.ready) await codex.stop().catch(() => {});
     setTakeoverState("failed", error.message || "接管失败");
     mode = (await inspectDesktopProcesses()).running ? "desktop" : "available";
     await recordControlAudit("takeover-failed", req, { error: error.message || "接管失败" });
@@ -704,7 +716,10 @@ codex.on("notification", (data) => {
   if (method === "item/started" && threadId) {
     const item = params.item || {};
     const labels = { reasoning: ["thinking", "正在思考"], commandExecution: ["command", "正在执行命令"], fileChange: ["file", "正在修改文件"], webSearch: ["search", "正在搜索"], mcpToolCall: ["tool", "正在调用工具"], dynamicToolCall: ["tool", "正在调用工具"], imageGeneration: ["image", "正在生成图片"] };
-    const [phase, label] = labels[item.type] || ["working", "正在处理"];
+    const browserTool = item.type === "mcpToolCall" && /^(browser_|playwright\b)/i.test(String(item.tool || item.toolName || item.name || ""));
+    if (browserTool) markBrowserVerified();
+    const [phase, defaultLabel] = labels[item.type] || ["working", "正在处理"];
+    const label = browserTool ? "正在操作浏览器" : defaultLabel;
     const detail = item.type === "commandExecution" ? String(item.command || "").replace(/\s+/g, " ").slice(0, 100) : "";
     setThreadActivity(threadId, phase, label, detail);
   }
@@ -724,7 +739,13 @@ codex.on("stderr", (chunk) => {
   const message = String(chunk).trimEnd();
   if (message) console.error(`[codex app-server] ${message}`);
 });
-codex.on("status", (data) => { broadcast({ type: "status", data }); if (data.ready && mode === "web") for (const threadId of Object.keys(queues)) scheduleQueue(threadId, 100); });
+codex.on("status", (data) => {
+  if (data.browser) browserState = normalizeBrowserState(data.browser);
+  if (!data.ready) browserState = normalizeBrowserState({ ...browserState, ready: false, message: "Codex 后端未运行，浏览器不可用" });
+  broadcast({ type: "status", data: { ...data, browser: publicBrowserState() } });
+  broadcastState();
+  if (data.ready && mode === "web") for (const threadId of Object.keys(queues)) scheduleQueue(threadId, 100);
+});
 
 async function processQueue(threadId) {
   if (queueWorkers.has(threadId) || threadSubmissions.has(threadId) || mode !== "web" || !codex.ready || !(queues[threadId]?.length)) return;
@@ -793,12 +814,14 @@ async function resumeThread(threadId, { recoverEmpty = false } = {}) {
   try {
     const result = await codex.request("thread/resume", { threadId, ...(testMode ? { excludeTurns: true } : {}), ...threadPermissionOverrides() });
     syncThreadRuntime(result?.thread);
+    await ensureBrowserGuidance(threadId);
     return result;
   }
   catch (error) {
     if (/not materialized yet|includeTurns is unavailable before first user message/i.test(error.message)) {
       const result = await codex.request("thread/read", { threadId, includeTurns: false });
       syncThreadRuntime(result?.thread);
+      await ensureBrowserGuidance(threadId);
       return result;
     }
     if (recoverEmpty && /thread not loaded|no rollout found|thread not found/i.test(error.message)) {
@@ -1718,7 +1741,38 @@ async function localDraftThreads() {
 
 async function mergeThreadCache(thread, { localDraft = false } = {}) { if (thread?.id) await saveThreadCache([{ ...thread, ...(localDraft ? { localDraft: true } : {}) }]); }
 function broadcastQueue(threadId) { broadcast({ type: "queue", data: { threadId, items: queues[threadId] || [] } }); }
-function broadcastState() { broadcast({ type: "control", data: { mode, transition, takeoverState, fullAccess, ready: codex.ready, webClientCount: sockets.size, sharedWebControl: mode === "web" } }); }
+function normalizeBrowserState(value = {}) {
+  const tools = Array.isArray(value.tools) ? value.tools.map(String).sort() : [];
+  const missingTools = Array.isArray(value.missingTools) ? value.missingTools.map(String) : [];
+  return {
+    configured: value.configured !== false,
+    ready: Boolean(value.ready),
+    verified: Boolean(value.verified),
+    server: String(value.server || "playwright"),
+    tools,
+    missingTools,
+    message: String(value.message || (value.ready ? "独立 Edge 浏览器已就绪" : "浏览器后端不可用")),
+    checkedAt: Number(value.checkedAt || Date.now()),
+  };
+}
+
+function publicBrowserState() {
+  return normalizeBrowserState(browserState);
+}
+
+function markBrowserVerified() {
+  if (browserState.verified) return;
+  browserState = normalizeBrowserState({ ...browserState, ready: true, verified: true, message: "独立 Edge 浏览器正在使用" });
+  broadcastState();
+}
+
+async function refreshBrowserState() {
+  browserState = normalizeBrowserState(await codex.refreshBrowserStatus());
+  broadcastState();
+  return publicBrowserState();
+}
+
+function broadcastState() { broadcast({ type: "control", data: { mode, transition, takeoverState, fullAccess, codexReady: codex.ready, browser: publicBrowserState(), webClientCount: sockets.size, sharedWebControl: mode === "web" } }); }
 function broadcast(message, record = true) {
   const event = record ? { ...message, seq: ++eventSeq, at: Date.now() } : message;
   if (record) {
@@ -1788,11 +1842,23 @@ function setThreadActivity(threadId, phase, label, detail = "") {
 function threadPermissionOverrides() { return fullAccess ? { approvalPolicy: "never", sandbox: "danger-full-access" } : {}; }
 function turnPermissionOverrides() { return fullAccess ? { approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } } : {}; }
 function threadStartOverrides(value = {}) {
-  const result = {};
+  const result = browserState.configured ? { developerInstructions: browserDeveloperInstructions } : {};
   if (value.model) result.model = String(value.model).slice(0, 120);
   if (["none", "friendly", "pragmatic"].includes(value.personality)) result.personality = value.personality;
   if (value.serviceTier) result.serviceTier = String(value.serviceTier).slice(0, 40);
   return result;
+}
+
+async function ensureBrowserGuidance(threadId) {
+  if (!threadId || !browserState.configured || browserGuidedThreads.has(threadId)) return;
+  try {
+    await codex.request("thread/settings/update", { threadId, developerInstructions: browserDeveloperInstructions });
+    browserGuidedThreads.add(threadId);
+  } catch (error) {
+    // Guidance makes Web browser use more reliable, but a legacy thread that
+    // rejects the setting should remain usable rather than fail to open.
+    console.warn(`browser guidance update failed for ${threadId}: ${error.message}`);
+  }
 }
 
 function turnOverrides(value = {}) {
@@ -2018,13 +2084,13 @@ async function latestRelease(force = false) {
   const data = await response.json();
   const latestVersion = String(data.tag_name || "").replace(/^v/i, "");
   const assets = Array.isArray(data.assets) ? data.assets : [];
-  const hasSetup = assets.some((asset) => /CodexWebRemote-Setup-.*-win-x64\.exe$/i.test(String(asset.name || "")));
-  const hasHash = assets.some((asset) => /CodexWebRemote-Setup-.*-win-x64\.exe\.sha256$/i.test(String(asset.name || "")));
+  const hasPortable = assets.some((asset) => /CodexWebRemote-Portable-.*-win-x64\.zip$/i.test(String(asset.name || "")));
+  const hasHash = assets.some((asset) => /CodexWebRemote-Portable-.*-win-x64\.zip\.sha256$/i.test(String(asset.name || "")));
   const value = {
     latestVersion,
     releaseUrl: String(data.html_url || ""),
     publishedAt: data.published_at || null,
-    updateAvailable: !data.draft && !data.prerelease && hasSetup && hasHash && compareVersions(latestVersion, currentVersion) > 0,
+    updateAvailable: !data.draft && !data.prerelease && hasPortable && hasHash && compareVersions(latestVersion, currentVersion) > 0,
   };
   return cacheLatestRelease(value);
 }

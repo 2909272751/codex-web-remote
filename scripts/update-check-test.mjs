@@ -21,8 +21,8 @@ const releaseServer = http.createServer((request, response) => {
     prerelease: false,
     published_at: "2099-01-01T00:00:00Z",
     assets: [
-      { name: "CodexWebRemote-Setup-99.0.0-win-x64.exe" },
-      { name: "CodexWebRemote-Setup-99.0.0-win-x64.exe.sha256" },
+      { name: "CodexWebRemote-Portable-99.0.0-win-x64.zip" },
+      { name: "CodexWebRemote-Portable-99.0.0-win-x64.zip.sha256" },
     ],
   }));
 });
