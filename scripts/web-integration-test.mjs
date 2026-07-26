@@ -196,6 +196,10 @@ try {
   }
   const created = await request("/api/threads", { method: "POST", body: { cwd: root } });
   const threadId = created.thread.id;
+  const removable = await request("/api/threads", { method: "POST", body: { cwd: root } });
+  await request(`/api/threads/${removable.thread.id}`, { method: "DELETE", body: {} });
+  const afterDelete = await request("/api/threads");
+  if (afterDelete.data?.some((thread) => thread.id === removable.thread.id)) throw new Error("A Desktop-deleted task remained in the Web task list");
   const freshThread = await request(`/api/threads/${threadId}`);
   if (freshThread.thread?.id !== threadId) throw new Error("A newly created empty task could not be opened before its first message");
   let completedCount = 0;

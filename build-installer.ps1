@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.4.9"
+    [string]$Version = "2.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,7 +55,18 @@ foreach ($developmentPath in @(
     $target = Join-Path $deployDirectory $developmentPath
     if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
 }
-Move-Item -LiteralPath $deployDirectory -Destination $stageDirectory
+$stageMoveError = $null
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+    try {
+        Move-Item -LiteralPath $deployDirectory -Destination $stageDirectory -ErrorAction Stop
+        $stageMoveError = $null
+        break
+    } catch {
+        $stageMoveError = $_
+        if ($attempt -lt 5) { Start-Sleep -Milliseconds (400 * $attempt) }
+    }
+}
+if ($stageMoveError) { throw $stageMoveError }
 
 # node-pty ships native prebuilds for every desktop platform. This installer is
 # explicitly Windows x64, so retaining only its Windows x64 binary preserves

@@ -107,6 +107,8 @@ let updateCache = null;
 let eventSeq = 0;
 let desktopConflictCheckInFlight = false;
 let desktopSessionWatcher = null;
+let sessionIndexWatcher = null;
+let sessionIndexRefreshTimer = null;
 let readonlyAccountUsageRequest = null;
 let localSessionUsageCache = null;
 let lastControlAudit = await loadLastJsonLine(controlAuditFile);
@@ -125,6 +127,7 @@ setInterval(() => { void reconcileDesktopConflict(); }, 5000).unref();
 setInterval(() => { if (mode === "web" && codex.ready) void sampleAccountUsage(); }, 15 * 60_000).unref();
 setInterval(() => { if (mode === "desktop" && sockets.size) void pollDesktopLiveFiles(); }, 2_500).unref();
 startDesktopLiveWatcher();
+startSessionIndexWatcher();
 
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -352,19 +355,36 @@ app.get("/api/directories", requireAuth, asyncRoute(async (req, res) => {
 }));
 
 app.get("/api/threads", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
-  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
-  const result = await codex.request("thread/list", {
-    limit, sortKey: "recency_at", sortDirection: "desc",
-    archived: false, modelProviders: [], sourceKinds: null,
-  });
-  const liveThreads = result.data || [];
-  await saveThreadCache(liveThreads);
-  const merged = new Map((await readThreadPreviews()).map((thread) => [thread.id, thread]));
-  for (const thread of liveThreads) {
-    if (thread?.id) merged.set(thread.id, { ...merged.get(thread.id), ...thread });
-  }
-  const data = [...merged.values()].sort((left, right) => threadTime(right) - threadTime(left)).slice(0, limit);
-  res.json({ ...result, data });
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+  const result = await listLiveThreads(limit);
+  const drafts = await localDraftThreads();
+  for (const draft of drafts) if (!result.data.some((thread) => thread.id === draft.id)) result.data.push(draft);
+  result.data.sort((left, right) => threadTime(right) - threadTime(left));
+  // The Desktop app-server is authoritative whenever Web control is active.
+  // Do not merge old local previews back into this response: that made a
+  // Desktop-deleted task reappear in the Web list indefinitely.
+  await replaceThreadCache(result.data);
+  res.json(result);
+}));
+
+app.post("/api/threads/:id/archive", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  const threadId = String(req.params.id || "");
+  await assertThreadCanBeRemoved(threadId);
+  await removePersistedThread("thread/archive", threadId);
+  await forgetThreadLocally(threadId);
+  broadcast({ type: "threadRemoved", data: { threadId, action: "archived" } });
+  res.json({ ok: true, action: "archived" });
+}));
+
+app.delete("/api/threads/:id", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  const threadId = String(req.params.id || "");
+  await assertThreadCanBeRemoved(threadId);
+  // This is the official app-server delete operation.  It deletes the same
+  // persisted thread that the Desktop App lists, not merely a Web cache entry.
+  await removePersistedThread("thread/delete", threadId);
+  await forgetThreadLocally(threadId);
+  broadcast({ type: "threadRemoved", data: { threadId, action: "deleted" } });
+  res.json({ ok: true, action: "deleted" });
 }));
 
 app.post("/api/threads", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -376,7 +396,7 @@ app.post("/api/threads", requireAuth, requireController, requireSameOrigin, asyn
   if (!stat.isDirectory()) return res.status(400).json({ error: "项目路径不是文件夹" });
   const params = { cwd, ...(testMode ? { ephemeral: true } : {}), ...threadStartOverrides(req.body), ...threadPermissionOverrides() };
   const result = await codex.request("thread/start", params);
-  if (result.thread?.id) { lastThreadId = result.thread.id; await mergeThreadCache(result.thread); }
+  if (result.thread?.id) { lastThreadId = result.thread.id; await mergeThreadCache(result.thread, { localDraft: testMode }); }
   res.json(result);
 }));
 
@@ -832,7 +852,7 @@ async function recoverEmptyThread(threadId) {
   const replacement = await codex.request("thread/start", { cwd: normalizeProjectPath(cached.cwd), ...(testMode ? { ephemeral: true } : {}), ...threadPermissionOverrides() });
   if (!replacement.thread?.id) return null;
   const nextCache = cachedThreads.filter((thread) => thread?.id !== threadId);
-  nextCache.unshift(normalizeThread(replacement.thread));
+  nextCache.unshift(normalizeThread({ ...replacement.thread, ...(testMode ? { localDraft: true } : {}) }));
   await atomicJson(threadCacheFile, nextCache.sort((left, right) => threadTime(right) - threadTime(left)).slice(0, 100));
   lastThreadId = replacement.thread.id;
   return { ...replacement, replacedThreadId: threadId };
@@ -862,6 +882,65 @@ async function buildInput(text, attachmentIds, ownerToken = "") {
   if (message.trim()) input.unshift({ type: "text", text: message.trim() });
   return input;
 }
+
+async function listLiveThreads(limit = 100) {
+  const data = [];
+  let cursor = null;
+  // The app-server is paginated.  Fetch enough history for the Web sidebar
+  // without letting a corrupted or changing cursor spin forever.
+  while (data.length < limit) {
+    const page = await codex.request("thread/list", {
+      ...(cursor ? { cursor } : {}),
+      limit: Math.min(100, limit - data.length),
+      sortKey: "recency_at", sortDirection: "desc",
+      archived: false, modelProviders: [], sourceKinds: null,
+    });
+    const rows = Array.isArray(page?.data) ? page.data : [];
+    data.push(...rows);
+    if (!page?.nextCursor || !rows.length) return { ...page, data };
+    cursor = page.nextCursor;
+  }
+  return { data, nextCursor: cursor, backwardsCursor: null };
+}
+
+async function assertThreadCanBeRemoved(threadId) {
+  if (!threadId) throw httpError(400, "缺少任务 ID");
+  if (activeTurns.has(threadId) || threadSubmissions.has(threadId)) throw httpError(409, "任务正在运行，不能删除或归档");
+  if (queues[threadId]?.length) throw httpError(409, "任务还有排队消息，请先清空队列");
+  const thread = await codex.request("thread/read", { threadId, includeTurns: false });
+  const status = thread?.thread?.status;
+  if (status?.type === "active" || status === "active") throw httpError(409, "任务正在运行，不能删除或归档");
+}
+
+async function removePersistedThread(method, threadId) {
+  try { await codex.request(method, { threadId }); }
+  catch (error) {
+    // Test-mode empty threads are deliberately ephemeral so integration tests
+    // do not write to a real Codex profile.  They have no Desktop record to
+    // remove, but should still disappear from the local Web draft list.
+    const isDraft = (await localDraftThreads()).some((thread) => thread.id === threadId);
+    if (!testMode || !isDraft || !/not persisted|no rollout found/i.test(String(error?.message || ""))) throw error;
+  }
+}
+
+async function forgetThreadLocally(threadId) {
+  const existing = await loadJson(threadCacheFile, []);
+  await atomicJson(threadCacheFile, existing.filter((thread) => thread?.id !== threadId));
+  delete queues[threadId];
+  await saveQueues();
+  activeTurns.delete(threadId);
+  threadActivities.delete(threadId);
+  threadStatuses.delete(threadId);
+  threadSettings.delete(threadId);
+  threadTokenUsage.delete(threadId);
+  turnPlans.delete(threadId);
+  turnDiffs.delete(threadId);
+  readonlyThreadCache.delete(threadId);
+  readonlyThreadRequests.delete(threadId);
+  threadSnapshotCache.delete(threadId);
+  try { await fsp.rm(threadSnapshotFile(threadId), { force: true }); } catch { }
+  if (lastThreadId === threadId) lastThreadId = null;
+}
 async function saveQueues() { await atomicJson(queueFile, queues); }
 
 async function readThreadPreviews() {
@@ -878,7 +957,15 @@ async function readThreadPreviews() {
       } catch { }
     }
   } catch { }
-  return [...merged.values()].sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 100);
+  const previews = [...merged.values()].sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 100);
+  // session_index.jsonl intentionally stores only a title and timestamp.
+  // Resolve missing cwd from the session metadata so a valid Desktop task is
+  // not incorrectly hidden by the selected Web project filter.
+  await Promise.all(previews.filter((thread) => !thread.cwd).map(async (thread) => {
+    const metadata = await readSessionMetadata(thread.id);
+    if (metadata.cwd) thread.cwd = metadata.cwd;
+  }));
+  return previews;
 }
 
 async function readReadonlyThread(threadId) {
@@ -1017,6 +1104,30 @@ async function findSessionFile(threadId) {
   return null;
 }
 
+const sessionMetadataCache = new Map();
+async function readSessionMetadata(threadId) {
+  const cached = sessionMetadataCache.get(threadId);
+  if (cached) return cached;
+  const metadata = { cwd: "" };
+  const file = await findSessionFile(threadId);
+  if (file) {
+    const stream = fs.createReadStream(file, { encoding: "utf8", start: 0, end: 256 * 1024 });
+    const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        let record;
+        try { record = JSON.parse(line); } catch { continue; }
+        if (record?.type !== "session_meta") continue;
+        metadata.cwd = String(record.payload?.cwd || "");
+        break;
+      }
+    } finally { lines.close(); stream.destroy(); }
+  }
+  sessionMetadataCache.set(threadId, metadata);
+  while (sessionMetadataCache.size > 250) sessionMetadataCache.delete(sessionMetadataCache.keys().next().value);
+  return metadata;
+}
+
 // Desktop Codex writes its conversation to JSONL while it is running.  Watch
 // those append-only files and forward only newly appended records; repeatedly
 // reparsing a multi-megabyte session on every token would make the Web UI slow.
@@ -1035,6 +1146,29 @@ function startDesktopLiveWatcher() {
     // avoids making the gateway startup depend on Codex having run before.
     setTimeout(startDesktopLiveWatcher, 5_000).unref();
   }
+}
+
+// Renaming a task in the Desktop App updates session_index.jsonl, not the
+// rollout file itself.  Watch it separately so the Web sidebar updates while
+// staying in read-only mode instead of waiting for a manual refresh.
+function startSessionIndexWatcher() {
+  if (sessionIndexWatcher) return;
+  const parent = path.dirname(sessionIndexFile);
+  const filename = path.basename(sessionIndexFile);
+  try {
+    sessionIndexWatcher = fs.watch(parent, (_event, changed) => {
+      const name = Buffer.isBuffer(changed) ? changed.toString("utf8") : String(changed || "");
+      if (name && name !== filename) return;
+      clearTimeout(sessionIndexRefreshTimer);
+      sessionIndexRefreshTimer = setTimeout(() => {
+        sessionIndexRefreshTimer = null;
+        readonlyThreadCache.clear();
+        broadcast({ type: "threadIndexChanged", data: { at: Date.now() } });
+      }, 180);
+      sessionIndexRefreshTimer.unref();
+    });
+    sessionIndexWatcher.on("error", () => { try { sessionIndexWatcher?.close(); } catch { } sessionIndexWatcher = null; setTimeout(startSessionIndexWatcher, 5_000).unref(); });
+  } catch { setTimeout(startSessionIndexWatcher, 5_000).unref(); }
 }
 
 async function primeDesktopLiveFiles() {
@@ -1252,7 +1386,7 @@ function forwardDesktopResponseItem(state, payload = {}) {
 }
 
 function normalizeThread(thread) {
-  return { id: thread.id, preview: thread.preview || thread.thread_name || "未命名任务", cwd: thread.cwd || "", recencyAt: thread.recencyAt, updatedAt: thread.updatedAt || thread.updated_at, createdAt: thread.createdAt };
+  return { id: thread.id, preview: thread.preview || thread.thread_name || "未命名任务", cwd: thread.cwd || "", recencyAt: thread.recencyAt, updatedAt: thread.updatedAt || thread.updated_at, createdAt: thread.createdAt, ...(thread.localDraft ? { localDraft: true } : {}) };
 }
 
 function normalizeProjectStore(value) {
@@ -1296,7 +1430,8 @@ async function projectCatalog() {
   const byPath = new Map();
   for (const project of projectStore.projects) byPath.set(projectPathKey(project.path), { ...project, saved: true });
   const hidden = new Set(projectStore.hiddenPaths);
-  for (const thread of await readThreadPreviews()) {
+  const sourceThreads = await catalogThreads();
+  for (const thread of sourceThreads) {
     if (!thread?.cwd || !path.isAbsolute(String(thread.cwd))) continue;
     const projectPath = normalizeProjectPath(thread.cwd);
     const key = projectPathKey(projectPath);
@@ -1311,6 +1446,20 @@ async function projectCatalog() {
     });
   }
   return [...byPath.values()].sort((left, right) => Number(right.saved) - Number(left.saved) || right.updatedAt - left.updatedAt || left.name.localeCompare(right.name, "zh-CN"));
+}
+
+async function catalogThreads() {
+  if (mode !== "web" || !codex.ready) return readThreadPreviews();
+  try {
+    const result = await listLiveThreads(500);
+    const drafts = await localDraftThreads();
+    for (const draft of drafts) if (!result.data.some((thread) => thread.id === draft.id)) result.data.push(draft);
+    await replaceThreadCache(result.data);
+    return result.data;
+  } catch {
+    // Losing the live connection should not blank a user's saved project list.
+    return readThreadPreviews();
+  }
 }
 
 async function saveProjects() { await atomicJson(projectFile, projectStore); }
@@ -1549,7 +1698,25 @@ async function saveThreadCache(threads) {
   await atomicJson(threadCacheFile, [...merged.values()].sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 100));
 }
 
-async function mergeThreadCache(thread) { if (thread?.id) await saveThreadCache([thread]); }
+async function replaceThreadCache(threads) {
+  const drafts = await localDraftThreads();
+  const normalized = [];
+  const seen = new Set();
+  for (const thread of Array.isArray(threads) ? threads : []) {
+    if (!thread?.id || seen.has(thread.id)) continue;
+    seen.add(thread.id);
+    normalized.push(normalizeThread(thread));
+  }
+  for (const draft of drafts) if (!seen.has(draft.id)) normalized.push(draft);
+  await atomicJson(threadCacheFile, normalized.sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 500));
+}
+
+async function localDraftThreads() {
+  const cached = await loadJson(threadCacheFile, []);
+  return cached.filter((thread) => thread?.localDraft && thread?.id).map(normalizeThread);
+}
+
+async function mergeThreadCache(thread, { localDraft = false } = {}) { if (thread?.id) await saveThreadCache([{ ...thread, ...(localDraft ? { localDraft: true } : {}) }]); }
 function broadcastQueue(threadId) { broadcast({ type: "queue", data: { threadId, items: queues[threadId] || [] } }); }
 function broadcastState() { broadcast({ type: "control", data: { mode, transition, takeoverState, fullAccess, ready: codex.ready, webClientCount: sockets.size, sharedWebControl: mode === "web" } }); }
 function broadcast(message, record = true) {

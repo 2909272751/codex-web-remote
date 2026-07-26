@@ -33,6 +33,14 @@ window.visualViewport?.addEventListener("resize", scheduleViewportSync, { passiv
 window.visualViewport?.addEventListener("scroll", scheduleViewportSync, { passive: true });
 boot();
 setInterval(() => { if (!document.hidden && state.activity) renderActivity(); }, 1000);
+// The Desktop App can rename tasks without changing Web control state.  Keep
+// the visible sidebar current even on systems where filesystem watching is
+// delayed by sync software or antivirus.
+setInterval(() => {
+  if (document.hidden || !state.control) return;
+  const refresh = state.control.mode === "web" && state.control.controller ? loadThreads() : loadThreadPreviews();
+  refresh.catch(() => {});
+}, 8000);
 
 function readTheme() {
   try { return localStorage.getItem("codex-web-theme") || "system"; } catch { return "system"; }
@@ -237,7 +245,10 @@ function renderControl() {
   const labels = { desktop: "桌面 App 正在使用；接管后会正常关闭桌面 App", available: "桌面 App 未运行，可以接管", web: "Web 共享控制已开启，可在多个设备同时使用" };
   $("controlText").textContent = c.transition ? (c.takeoverState?.message || "正在切换…") : (c.takeoverState?.phase === "failed" ? `接管失败：${c.takeoverState.message}` : (labels[c.mode] || c.mode));
   const canControl = c.mode === "web" && c.controller;
-  for (const id of ["messageInput", "sendMode"]) $(id).disabled = !canControl || !state.current;
+  // Reading and drafting are safe in read-only mode.  Keep the draft locally
+  // while takeover finishes; only the action that changes Codex stays locked.
+  $("messageInput").disabled = !state.current;
+  $("sendMode").disabled = !canControl || !state.current;
   $("attachBtn").disabled = !state.current;
   $("sendBtn").disabled = !canControl || !state.current;
   $("permissionShortcut").disabled = !canControl;
@@ -312,8 +323,23 @@ async function loadProjects(preferredId = null) {
   renderProjects(); renderThreads();
 }
 async function loadModels() { return singleFlight("models", async () => { const result = await api("/api/models"); state.models = result.data || []; renderModels(); }); }
-function renderModels() { const select = $("modelSelect"); const selected = select.value; const options = [new Option("默认模型", "")]; for (const model of state.models) options.push(new Option(model.displayName || model.name || model.model || model.id, model.model || model.id)); select.replaceChildren(...options); if ([...select.options].some((item) => item.value === selected)) select.value = selected; renderEfforts(); }
-function renderEfforts() { const model = state.models.find((item) => (item.model || item.id) === $("modelSelect").value); const values = model?.supportedReasoningEfforts || []; const selected = $("effortSelect").value; const labels = { none: "无思考", minimal: "极轻", low: "轻度", medium: "中等", high: "较深", xhigh: "深度", max: "最深", ultra: "Ultra" }; $("effortSelect").replaceChildren(new Option("默认强度", ""), ...values.map((item) => { const value = typeof item === "string" ? item : (item.reasoningEffort || item.effort || item.value); return new Option(labels[value] || value, value); })); if ([...$("effortSelect").options].some((item) => item.value === selected)) $("effortSelect").value = selected; }
+function currentModelValue() { return state.currentSettings?.model || state.current?.model || $("modelSelect").value || state.models[0]?.model || state.models[0]?.id || ""; }
+function renderModels() {
+  const select = $("modelSelect"); const current = currentModelValue(); const options = [];
+  for (const model of state.models) { const value = model.model || model.id; if (value) options.push(new Option(model.displayName || model.name || value, value)); }
+  if (current && !options.some((item) => item.value === current)) options.unshift(new Option(current, current));
+  if (!options.length) options.push(new Option(current || "模型加载中…", current));
+  select.replaceChildren(...options); select.value = options.some((item) => item.value === current) ? current : options[0].value; renderEfforts();
+}
+function renderEfforts() {
+  const select = $("effortSelect"); const model = state.models.find((item) => (item.model || item.id) === $("modelSelect").value); const values = (model?.supportedReasoningEfforts || []).map((item) => typeof item === "string" ? item : (item.reasoningEffort || item.effort || item.value)).filter(Boolean);
+  const labels = { none: "无思考", minimal: "极轻", low: "轻度", medium: "中等", high: "较深", xhigh: "深度", max: "最深", ultra: "Ultra" };
+  const current = state.currentSettings?.effort || select.value || model?.defaultReasoningEffort || model?.default_reasoning_effort || (values.includes("medium") ? "medium" : values[0] || "");
+  const options = values.map((value) => new Option(labels[value] || value, value));
+  if (current && !options.some((item) => item.value === current)) options.unshift(new Option(labels[current] || current, current));
+  if (!options.length) options.push(new Option(current ? (labels[current] || current) : "强度加载中…", current));
+  select.replaceChildren(...options); select.value = options.some((item) => item.value === current) ? current : options[0].value;
+}
 
 async function createThread(cwdOverride = "") {
   if (state.control?.mode !== "web") return toast("请先接管 Codex");
@@ -359,7 +385,18 @@ function renderThreads() {
   const query = $("search").value.trim().toLowerCase();
   const project = state.projects.find((item) => item.id === state.selectedProjectId);
   const list = state.threads.filter((thread) => (!project || projectContainsPath(project.path, thread.cwd)) && `${thread.preview || thread.id} ${thread.cwd || ""}`.toLowerCase().includes(query));
-  const nodes = list.map((thread) => { const b = document.createElement("button"); b.className = `thread${(state.current?.id || state.pendingThreadId) === thread.id ? " active" : ""}`; const head = document.createElement("div"); head.className = "thread-head"; const title = document.createElement("strong"); title.textContent = thread.preview || "未命名任务"; head.append(title); if (state.control?.activeTurns?.[thread.id]) { const live = document.createElement("i"); live.className = "thread-live"; live.title = "正在运行"; head.append(live); } const queued = Number(state.control?.queuedByThread?.[thread.id] || 0); if (queued) { const badge = document.createElement("b"); badge.className = "thread-queue"; badge.textContent = queued; badge.title = `${queued} 条排队消息`; head.append(badge); } const meta = document.createElement("small"); meta.textContent = formatDate(thread.recencyAt || thread.updatedAt || thread.createdAt); b.append(head, meta); b.addEventListener("pointerenter", () => prefetchThreadSnapshot(thread)); b.addEventListener("touchstart", () => prefetchThreadSnapshot(thread), { passive: true }); b.addEventListener("focus", () => prefetchThreadSnapshot(thread)); b.addEventListener("click", () => state.control?.mode === "web" ? openThread(thread.id) : previewThread(thread)); return b; });
+  const nodes = list.map((thread) => {
+    const row = document.createElement("div"); row.className = `thread-row${(state.current?.id || state.pendingThreadId) === thread.id ? " active" : ""}`;
+    const b = document.createElement("button"); b.className = "thread"; b.type = "button";
+    const head = document.createElement("div"); head.className = "thread-head"; const title = document.createElement("strong"); title.textContent = thread.preview || "未命名任务"; head.append(title);
+    if (state.control?.activeTurns?.[thread.id]) { const live = document.createElement("i"); live.className = "thread-live"; live.title = "正在运行"; head.append(live); }
+    const queued = Number(state.control?.queuedByThread?.[thread.id] || 0);
+    if (queued) { const badge = document.createElement("b"); badge.className = "thread-queue"; badge.textContent = queued; badge.title = `${queued} 条排队消息`; head.append(badge); }
+    const meta = document.createElement("small"); meta.textContent = formatDate(thread.recencyAt || thread.updatedAt || thread.createdAt); b.append(head, meta);
+    b.addEventListener("pointerenter", () => prefetchThreadSnapshot(thread)); b.addEventListener("touchstart", () => prefetchThreadSnapshot(thread), { passive: true }); b.addEventListener("focus", () => prefetchThreadSnapshot(thread)); b.addEventListener("click", () => state.control?.mode === "web" ? openThread(thread.id) : previewThread(thread));
+    const actions = document.createElement("button"); actions.type = "button"; actions.className = "thread-actions"; actions.textContent = "⋯"; actions.title = state.control?.mode === "web" ? "归档或永久删除任务" : "接管 Codex 后可管理任务"; actions.setAttribute("aria-label", actions.title); actions.disabled = state.control?.mode !== "web"; actions.addEventListener("click", (event) => { event.stopPropagation(); openThreadActions(thread); });
+    row.append(b, actions); return row;
+  });
   if (!nodes.length) { const empty = document.createElement("div"); empty.className = "thread-list-empty"; empty.textContent = project ? "这个项目还没有任务" : "暂无任务"; nodes.push(empty); }
   $("threadList").replaceChildren(...nodes);
 }
@@ -464,6 +501,29 @@ async function previewThread(thread) {
     if (cachedView?.result?.thread) { $("chatMeta").textContent = `${cachedView.result.thread.cwd || thread.id} ? \u5df2\u663e\u793a\u7f13\u5b58\uff0c\u5237\u65b0\u5931\u8d25`; toast(error.message); return; }
     $("messages").replaceChildren(emptyNode(error.message)); toast(error.message);
   }
+}
+
+async function openThreadActions(thread) {
+  if (state.control?.mode !== "web") return toast("请先接管 Codex 才能管理任务");
+  const running = Boolean(state.control?.activeTurns?.[thread.id]);
+  const queued = Number(state.control?.queuedByThread?.[thread.id] || 0);
+  if (running || queued) return toast(running ? "任务正在运行，不能删除或归档" : "任务还有排队消息，请先清空队列");
+  const title = thread.preview || "未命名任务";
+  if (confirm(`归档“${title}”？\n归档后会从桌面 App 和 Web 的当前任务列表移除，可在以后恢复。\n\n选择“取消”继续选择永久删除。`)) return removeThread(thread, "archive");
+  if (confirm(`永久删除“${title}”？\n\n这会删除桌面 App 和 Web 中的同一份对话记录，无法恢复。`)) return removeThread(thread, "delete");
+}
+
+async function removeThread(thread, action) {
+  const threadId = thread.id;
+  try {
+    const url = `/api/threads/${encodeURIComponent(threadId)}${action === "archive" ? "/archive" : ""}`;
+    await api(url, { method: action === "archive" ? "POST" : "DELETE", body: {} });
+    state.threads = state.threads.filter((item) => item.id !== threadId);
+    state.threadViews.delete(threadId);
+    if (state.current?.id === threadId) { state.current = null; state.pendingThreadId = null; state.queue = []; $("messages").replaceChildren(emptyNode("任务已移除")); $("chatTitle").textContent = "选择一个任务"; $("chatMeta").textContent = "任务已从桌面 App 与 Web 同步移除"; }
+    renderThreads(); renderQueue(); updateComposer();
+    toast(action === "archive" ? "任务已归档，并已同步到桌面 App" : "任务已永久删除，并已同步到桌面 App");
+  } catch (error) { toast(error.message); }
 }
 
 async function checkForUpdates() {
@@ -680,6 +740,7 @@ function upsertItem(item) {
 
 async function sendMessage(event) {
   event.preventDefault(); if (!state.current) return;
+  if (!(state.control?.mode === "web" && state.control?.controller && !state.threadSyncing)) return toast("内容已保留为草稿；接管完成后即可发送");
   const text = $("messageInput").value.trim(); if (!text && !state.attachments.length) return;
   if (state.attachments.some((item) => item.status === "uploading")) return toast("附件还在上传，完成后再发送");
   const failed = state.attachments.find((item) => item.status === "failed");
@@ -701,7 +762,8 @@ async function sendMessage(event) {
 function updateComposer() {
   const can = state.control?.mode === "web" && state.control?.controller && state.current && !state.threadSyncing;
   const canAttach = Boolean(state.current || state.pendingThreadId);
-  for (const id of ["messageInput", "sendMode", "sendBtn", "modelSelect", "effortSelect", "summarySelect"]) $(id).disabled = !can;
+  $("messageInput").disabled = !state.current;
+  for (const id of ["sendMode", "sendBtn", "modelSelect", "effortSelect", "summarySelect"]) $(id).disabled = !can;
   $("attachBtn").disabled = !canAttach;
   $("interruptBtn").classList.add("hidden");
   $("sendBtn").classList.toggle("stop-mode", Boolean(state.activeTurnId));
@@ -863,6 +925,8 @@ async function resyncAfterGap() {
 function handleEvent(event) {
   if (event.seq) state.lastEventSeq = Math.max(state.lastEventSeq, Number(event.seq));
   if (event.type === "control") { const modeChanged = state.control?.mode !== event.data?.mode; state.control = { ...(state.control || {}), ...(event.data || {}) }; renderControl(); scheduleControlRefresh(modeChanged); return; }
+  if (event.type === "threadRemoved") { removeThreadFromView(event.data?.threadId); return; }
+  if (event.type === "threadIndexChanged") { (state.control?.mode === "web" && state.control?.controller ? loadThreads() : loadThreadPreviews()).catch(() => {}); return; }
   if (event.type === "hostUpdate") { $("updateBanner").classList.remove("hidden"); $("updateDetail").textContent = "主机正在准备更新，服务即将短暂重启…"; $("updateNowBtn").disabled = true; return; }
   if (event.type === "heartbeat") return;
   if (event.type === "activity" && state.current?.id === event.data.threadId) return setActivity(event.data.activity);
@@ -1258,6 +1322,14 @@ async function switchAccount() {
     $("accountSwitchOverlay").classList.add("hidden");
     toast(`\u8d26\u53f7\u5207\u6362\u5931\u8d25\uff1a${error.message}`);
   }
+}
+
+function removeThreadFromView(threadId) {
+  if (!threadId) return;
+  state.threads = state.threads.filter((thread) => thread.id !== threadId);
+  state.threadViews.delete(threadId);
+  if (state.current?.id === threadId) { state.current = null; state.pendingThreadId = null; state.queue = []; $("messages").replaceChildren(emptyNode("任务已移除")); $("chatTitle").textContent = "选择一个任务"; $("chatMeta").textContent = "任务已从桌面 App 与 Web 同步移除"; renderQueue(); updateComposer(); }
+  renderThreads();
 }
 
 function createBrowserId(prefix = "id") {

@@ -34,7 +34,7 @@ checks.theme_toggle_is_persistent = app.includes("codex-web-theme") && app.inclu
 checks.modern_ui_supports_reduced_motion = modern.includes("prefers-reduced-motion: reduce");
 checks.theme_dialog_text_contrast_is_hardened = modern.includes("Theme contrast hardening") && modern.includes(".toast,") && modern.includes("color: var(--ui-text)") && modern.includes(".interaction-detail") && modern.includes(".usage-card") && modern.includes(".project-dialog");
 checks.user_message_contrast_is_explicit = modern.includes("--ui-user-bg") && modern.includes("--ui-user-text") && modern.includes(".message.user { background: var(--ui-user-bg); color: var(--ui-user-text)");
-checks.mobile_layout_allocates_space = modern.includes("Mobile adaptive allocation") && modern.includes("max-height: min(58dvh, 430px)") && modern.includes("max-height: min(24dvh, 156px)") && modern.includes("grid-template-columns: auto minmax(0, 1fr) auto") && html.includes("1.4.9-stability1");
+checks.mobile_layout_allocates_space = modern.includes("Mobile adaptive allocation") && modern.includes("max-height: min(58dvh, 430px)") && modern.includes("max-height: min(24dvh, 156px)") && modern.includes("grid-template-columns: auto minmax(0, 1fr) auto") && html.includes('src="/app.js?v=2.0.0');
 checks.login_can_remember_password = html.includes('id="rememberPassword"') && app.includes("REMEMBER_PASSWORD_KEY") && app.includes("restoreRememberedPassword") && app.includes("saveRememberedPassword");
 checks.snapshot_sync_is_bounded = app.includes("snapshotTimer") && app.includes("10_000") && server.includes("readReadonlyThreadSingleFlight");
 checks.readonly_mode_uses_snapshots = app.includes("/api/threads/${encodeURIComponent(thread.id)}/snapshot") && app.includes("readonly-mode");
