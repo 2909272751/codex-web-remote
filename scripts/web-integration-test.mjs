@@ -76,6 +76,18 @@ try {
   child = await startServer();
   await request("/api/login", { method: "POST", body: { password } });
   if (!/Max-Age=86400/i.test(lastSetCookie) || !/SameSite=Lax/i.test(lastSetCookie)) throw new Error(`Unexpected session cookie: ${lastSetCookie}`);
+  const readonlyV1 = `${JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "READONLY_SNAPSHOT_V1" } })}\n`;
+  await fsp.appendFile(desktopSession, readonlyV1);
+  const firstReadonlySnapshot = await request(`/api/threads/${desktopThreadId}/snapshot`);
+  if (!JSON.stringify(firstReadonlySnapshot.thread).includes("READONLY_SNAPSHOT_V1")) throw new Error("Initial read-only snapshot did not parse its session file");
+  // The snapshot endpoint must compare the source file stamp rather than
+  // returning an indefinitely stale on-disk snapshot after Desktop appends.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await fsp.appendFile(desktopSession, `${JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "READONLY_SNAPSHOT_V2" } })}\n`);
+  const refreshedReadonlySnapshot = await request(`/api/threads/${desktopThreadId}/snapshot`);
+  if (refreshedReadonlySnapshot.cached || !JSON.stringify(refreshedReadonlySnapshot.thread).includes("READONLY_SNAPSHOT_V2")) {
+    throw new Error("Read-only snapshot did not refresh after its source session changed");
+  }
   const readonlyUploadResponse = await fetch(`${base}/api/uploads?name=${encodeURIComponent("readonly-upload.txt")}&type=text%2Fplain`, {
     method: "POST", headers: { Cookie: cookie, Origin: base, "Content-Type": "application/octet-stream" }, body: Buffer.from("READONLY_UPLOAD_OK"),
   });
@@ -195,7 +207,7 @@ try {
     // The quota endpoint is a separate ChatGPT backend and can be temporarily
     // unavailable while normal Codex turns still work. Keep the integration
     // suite useful without treating that external outage as a product failure.
-    if (!/failed to fetch codex rate limits|error sending request/i.test(error.message)) throw error;
+    if (!/failed to fetch codex rate limits|error sending request|account authentication required/i.test(error.message)) throw error;
     accountUsageVerified = false;
   }
   const created = await request("/api/threads", { method: "POST", body: { cwd: root } });

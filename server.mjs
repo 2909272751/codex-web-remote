@@ -499,10 +499,11 @@ app.get("/api/thread-previews", requireAuth, asyncRoute(async (req, res) => {
 
 app.get("/api/threads/:id/snapshot", requireAuth, asyncRoute(async (req, res) => {
   const cached = await readThreadSnapshot(req.params.id);
-  const thread = cached?.thread || await readReadonlyThreadSingleFlight(req.params.id);
+  const cachedIsFresh = await snapshotIsFresh(req.params.id, cached);
+  const thread = cachedIsFresh ? cached.thread : await readReadonlyThreadSingleFlight(req.params.id);
   if (!thread) return res.status(404).json({ error: "暂时没有该任务的本地快照" });
-  if (!cached) void writeThreadSnapshot(thread).catch(() => {});
-  res.json({ thread, cached: true, cachedAt: cached?.cachedAt || null, ...threadRuntimePayload(req.params.id) });
+  if (!cachedIsFresh) void writeThreadSnapshot(thread).catch(() => {});
+  res.json({ thread, cached: cachedIsFresh, cachedAt: cachedIsFresh ? cached?.cachedAt || null : null, ...threadRuntimePayload(req.params.id) });
 }));
 
 app.get("/api/threads/:id", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
@@ -849,9 +850,30 @@ async function readThreadSnapshot(threadId) {
   if (!value?.thread?.id) return null;
   rememberThreadSnapshot(threadId, value); return value;
 }
+async function sessionStamp(threadId) {
+  const file = await findSessionFile(threadId);
+  if (!file) return null;
+  try {
+    const stat = await fsp.stat(file);
+    return { size: stat.size, mtimeMs: stat.mtimeMs };
+  } catch { return null; }
+}
+async function snapshotIsFresh(threadId, cached) {
+  if (!cached?.thread) return false;
+  const source = await sessionStamp(threadId);
+  // Web-only or newly created threads may not have an on-disk rollout yet.
+  // Their in-memory snapshot is still the best available representation.
+  if (!source) return true;
+  return Number(cached.sourceSize) === source.size && Number(cached.sourceMtimeMs) === source.mtimeMs;
+}
 async function writeThreadSnapshot(thread) {
   if (!thread?.id || !Array.isArray(thread.turns)) return;
-  const value = { cachedAt: Date.now(), thread };
+  const source = await sessionStamp(thread.id);
+  const value = {
+    cachedAt: Date.now(),
+    ...(source ? { sourceSize: source.size, sourceMtimeMs: source.mtimeMs } : {}),
+    thread,
+  };
   rememberThreadSnapshot(thread.id, value);
   await atomicJson(threadSnapshotFile(thread.id), value);
 }
@@ -1409,7 +1431,9 @@ function forwardDesktopResponseItem(state, payload = {}) {
 }
 
 function normalizeThread(thread) {
-  return { id: thread.id, preview: thread.preview || thread.thread_name || "未命名任务", cwd: thread.cwd || "", recencyAt: thread.recencyAt, updatedAt: thread.updatedAt || thread.updated_at, createdAt: thread.createdAt, ...(thread.localDraft ? { localDraft: true } : {}) };
+  // App-server preview is a first-message excerpt; name/thread_name is the
+  // user-visible task title. Prefer the title so takeover keeps App renames.
+  return { id: thread.id, preview: thread.name || thread.thread_name || thread.preview || "未命名任务", cwd: thread.cwd || "", recencyAt: thread.recencyAt, updatedAt: thread.updatedAt || thread.updated_at, createdAt: thread.createdAt, ...(thread.localDraft ? { localDraft: true } : {}) };
 }
 
 function normalizeProjectStore(value) {
