@@ -1,4 +1,4 @@
-const CACHE = "codex-web-remote-v2.0.2-sync1";
+const CACHE = "codex-web-remote-v2.0.3-busyfix1";
 const SHELL = ["/", "/styles.css", "/layout-fix.css", "/modern-ui.css", "/app.js", "/reasoning-state.js", "/timeline.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

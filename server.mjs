@@ -36,6 +36,9 @@ const updatePageUrl = process.env.CODEX_WEB_UPDATE_PAGE || "https://github.com/2
 const currentVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0";
 const sessionIndexFile = path.join(process.env.USERPROFILE || root, ".codex", "session_index.jsonl");
 const sessionRoot = process.env.CODEX_WEB_SESSION_ROOT ? path.resolve(process.env.CODEX_WEB_SESSION_ROOT) : path.join(process.env.USERPROFILE || root, ".codex", "sessions");
+// Session JSONL files are append-only. A crash can leave task_started as the
+// final record forever, so only recent lifecycle activity may block takeover.
+const desktopActivityFreshMs = Math.max(30_000, Number(process.env.CODEX_WEB_DESKTOP_ACTIVITY_FRESH_MS) || 120_000);
 const uploadDir = process.env.CODEX_WEB_UPLOAD_DIR ? path.resolve(process.env.CODEX_WEB_UPLOAD_DIR) : path.join(process.env.USERPROFILE || root, ".codex", "web-uploads");
 const launcherSettingsFile = process.env.CODEX_WEB_SETTINGS_FILE
   ? path.resolve(process.env.CODEX_WEB_SETTINGS_FILE)
@@ -2025,6 +2028,7 @@ async function isDesktopRunning() { return (await inspectDesktopProcesses()).run
 async function inspectDesktopActivity(desktop = null) {
   desktop ||= await inspectDesktopProcesses();
   if (!desktop.running) return { running: false };
+  const checkedAt = Date.now();
   const processStartedAt = Math.min(...desktop.processes.map((item) => Date.parse(item.startedAt)).filter(Number.isFinite));
   const files = [];
   const stack = [sessionRoot];
@@ -2052,9 +2056,15 @@ async function inspectDesktopActivity(desktop = null) {
       if (Number.isFinite(processStartedAt) && Number.isFinite(at) && at < processStartedAt - 10_000) continue;
       lifecycle = { type: record.payload.type, turnId: record.payload.turn_id, timestamp: record.timestamp, file: file.target };
     }
-    if (lifecycle?.type === "task_started") return { running: true, ...lifecycle };
+    if (lifecycle?.type !== "task_started") continue;
+    const eventAt = Date.parse(lifecycle.timestamp);
+    const fileFresh = checkedAt - file.mtimeMs <= desktopActivityFreshMs;
+    // Older records may not have a timestamp. For those, a fresh append is
+    // enough evidence; otherwise both the event and file must be recent.
+    const eventFresh = !Number.isFinite(eventAt) || checkedAt - eventAt <= desktopActivityFreshMs;
+    if (fileFresh && eventFresh) return { running: true, ...lifecycle, checkedAt, freshnessMs: desktopActivityFreshMs };
   }
-  return { running: false };
+  return { running: false, checkedAt, freshnessMs: desktopActivityFreshMs };
 }
 
 async function closeDesktop(force, immediate = false, initialSnapshot = null) {

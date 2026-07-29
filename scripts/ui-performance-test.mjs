@@ -34,7 +34,7 @@ checks.theme_toggle_is_persistent = app.includes("codex-web-theme") && app.inclu
 checks.modern_ui_supports_reduced_motion = modern.includes("prefers-reduced-motion: reduce");
 checks.theme_dialog_text_contrast_is_hardened = modern.includes("Theme contrast hardening") && modern.includes(".toast,") && modern.includes("color: var(--ui-text)") && modern.includes(".interaction-detail") && modern.includes(".usage-card") && modern.includes(".project-dialog");
 checks.user_message_contrast_is_explicit = modern.includes("--ui-user-bg") && modern.includes("--ui-user-text") && modern.includes(".message.user { background: var(--ui-user-bg); color: var(--ui-user-text)");
-checks.mobile_layout_allocates_space = modern.includes("Mobile adaptive allocation") && modern.includes("max-height: min(58dvh, 430px)") && modern.includes("max-height: min(24dvh, 156px)") && modern.includes("grid-template-columns: auto minmax(0, 1fr) auto") && html.includes('src="/app.js?v=2.0.2-');
+checks.mobile_layout_allocates_space = modern.includes("Mobile adaptive allocation") && modern.includes("max-height: min(58dvh, 430px)") && modern.includes("max-height: min(24dvh, 156px)") && modern.includes("grid-template-columns: auto minmax(0, 1fr) auto") && html.includes('src="/app.js?v=2.0.3-');
 checks.login_can_remember_password = html.includes('id="rememberPassword"') && app.includes("REMEMBER_PASSWORD_KEY") && app.includes("restoreRememberedPassword") && app.includes("saveRememberedPassword");
 checks.snapshot_sync_is_bounded = app.includes("snapshotTimer") && app.includes("10_000") && server.includes("readReadonlyThreadSingleFlight");
 checks.readonly_mode_uses_snapshots = app.includes("/api/threads/${encodeURIComponent(thread.id)}/snapshot") && app.includes("readonly-mode");
@@ -57,6 +57,7 @@ checks.desktop_output_is_incrementally_streamed = server.includes("desktopLive")
 checks.reconnect_restores_task_and_uses_bounded_backoff = app.includes("restoreLastThread") && app.includes("codex-web-last-thread") && app.includes("500 * 2 ** state.reconnectCount") && app.includes("navigator.onLine !== false");
 checks.takeover_keeps_the_official_task_name = server.includes("thread.name || thread.thread_name || thread.preview");
 checks.readonly_snapshot_revalidates_the_source_session = server.includes("async function snapshotIsFresh") && server.includes("sourceMtimeMs") && server.includes("const cachedIsFresh = await snapshotIsFresh");
+checks.stale_desktop_task_markers_do_not_block_takeover = server.includes("desktopActivityFreshMs") && server.includes("fileFresh && eventFresh") && server.includes("only recent lifecycle activity may block takeover");
 
 const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
 if (failed.length) throw new Error(`UI performance regression: ${failed.join(", ")}`);

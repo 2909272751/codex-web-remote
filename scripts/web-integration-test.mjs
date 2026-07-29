@@ -318,6 +318,15 @@ try {
   await waitFor(async () => (await request("/api/session")).mode === "desktop", 15_000);
   const controlAudit = await fsp.readFile(path.join(temp, "data", "control-audit.jsonl"), "utf8");
   if (!controlAudit.includes('"action":"auto-yield-to-desktop"')) throw new Error("Idle Web control did not automatically yield to the desktop app");
+  // An interrupted desktop task can leave task_started behind permanently.
+  // Once the JSONL has gone quiet, it must no longer lock Web takeover.
+  const staleStart = `${JSON.stringify({ type: "event_msg", timestamp: new Date(Date.now() - 10 * 60_000).toISOString(), payload: { type: "task_started", turn_id: "stale-desktop-turn" } })}\n`;
+  await fsp.appendFile(desktopSession, staleStart);
+  const staleAt = new Date(Date.now() - 10 * 60_000);
+  await fsp.utimes(desktopSession, staleAt, staleAt);
+  await request("/api/control/takeover", { method: "POST", body: {} });
+  const staleTakeoverStatus = await request("/api/control/status");
+  if (staleTakeoverStatus.mode !== "web") throw new Error("A stale desktop task_started record blocked takeover");
   console.log(`WEB_INTEGRATION_OK reasoning_events=${sawReasoning} account_usage=${accountUsageVerified ? "verified" : "upstream_unavailable"}`);
   if (stderr.trim()) console.error(stderr.trim());
 } finally {
