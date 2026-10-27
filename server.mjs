@@ -11,6 +11,10 @@ import { CodexClient } from "./src/codex-client.mjs";
 import { canAutoYieldToDesktop } from "./src/control-policy.mjs";
 import { buildServerRequestResponse } from "./src/server-request.mjs";
 import { TerminalSession } from "./src/terminal-session.mjs";
+import { ThreadViews, relatedAgentIds } from "./src/thread-view.mjs";
+import { planDesktopTermination, readWindowsProcessTable, terminateDesktopProcesses, waitForProcessesExit, desktopLifecycleIsFresh } from './src/windows-process-control.mjs';
+import { readAppThreadTitles } from './src/app-thread-titles.mjs';
+import { readAppProjects } from './src/app-projects.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 loadEnvFile(process.env.CODEX_WEB_ENV_FILE ? path.resolve(process.env.CODEX_WEB_ENV_FILE) : path.join(root, ".env.local"));
@@ -39,11 +43,43 @@ const sessionRoot = process.env.CODEX_WEB_SESSION_ROOT ? path.resolve(process.en
 // Session JSONL files are append-only. A crash can leave task_started as the
 // final record forever, so only recent lifecycle activity may block takeover.
 const desktopActivityFreshMs = Math.max(30_000, Number(process.env.CODEX_WEB_DESKTOP_ACTIVITY_FRESH_MS) || 120_000);
+const codexHomeDir = path.dirname(sessionIndexFile);
+const rawTitleCacheMs = Number(process.env.CODEX_WEB_TITLE_CACHE_MS);
+const appTitleCacheMs = Number.isFinite(rawTitleCacheMs) && rawTitleCacheMs >= 0 ? rawTitleCacheMs : 2_000;
 const uploadDir = process.env.CODEX_WEB_UPLOAD_DIR ? path.resolve(process.env.CODEX_WEB_UPLOAD_DIR) : path.join(process.env.USERPROFILE || root, ".codex", "web-uploads");
 const launcherSettingsFile = process.env.CODEX_WEB_SETTINGS_FILE
   ? path.resolve(process.env.CODEX_WEB_SETTINGS_FILE)
   : path.join(process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || root, "AppData", "Local"), "CodexWebRemote", "settings.json");
+// Password-less entry: the tray QR carries ?t=<accessToken>, which exchanges
+// for a long-lived cookie so a phone never has to type the web password.
+const accessTokenFile = path.join(dataDir, "access-token.json");
+const accessSessionMs = Math.max(sessionMs, Math.max(1, Number(process.env.CODEX_WEB_ACCESS_DAYS || 30)) * 24 * 3600_000);
+// 88frp rotates its public node IP; the local frpc state files tell us the
+// current node and the tunnel that fronts this gateway (no credentials needed).
+const frpDataRoot = process.env.CODEX_WEB_FRP_DATA_ROOT ? path.resolve(process.env.CODEX_WEB_FRP_DATA_ROOT) : "C:\\ProgramData\\88frp-node\\data";
+// The tunnel that fronts this gateway is identified by its local port; tests
+// and unusual deployments can override which local port to look for.
+const frpLocalPort = Number(process.env.CODEX_WEB_FRP_LOCAL_PORT || 0) || port;
+const publicAddressRefreshMs = Math.max(60_000, Number(process.env.CODEX_WEB_PUBLIC_REFRESH_MS) || 5 * 60_000);
+const desktopProbeTtlMs = Math.max(500, Number(process.env.CODEX_WEB_DESKTOP_PROBE_TTL_MS) || 3000);
+// Takeover used to inherit the generic 25s/60s command timeouts. A phone or
+// tunnel can give up long before that and leave the page looking disconnected.
+// Keep every destructive preflight bounded and fail closed (never kill unless
+// the desktop is positively confirmed idle).
+const takeoverProbeTimeoutMs = Math.max(2_000, Number(process.env.CODEX_WEB_TAKEOVER_PROBE_TIMEOUT_MS) || 8_000);
+const takeoverActivityTimeoutMs = Math.max(1_500, Number(process.env.CODEX_WEB_TAKEOVER_ACTIVITY_TIMEOUT_MS) || 6_000);
+const takeoverCloseTimeoutMs = Math.max(4_000, Number(process.env.CODEX_WEB_TAKEOVER_CLOSE_TIMEOUT_MS) || 15_000);
+const takeoverStartTimeoutMs = Math.max(8_000, Number(process.env.CODEX_WEB_TAKEOVER_START_TIMEOUT_MS) || 35_000);
+const autoPrepareEnabled = process.env.CODEX_WEB_AUTO_PREPARE !== "0";
+// Releasing control hands the session back to the desktop app, which takes a
+// few seconds to appear. Without this window a reconnect in that gap would see
+// "desktop not running" and immediately pull control back to the web.
+const autoPrepareSuppressMs = (() => {
+  const raw = Number(process.env.CODEX_WEB_AUTO_PREPARE_SUPPRESS_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
+})();
 const testMode = process.env.CODEX_WEB_TEST_MODE === "1";
+const persistTestThreads = testMode && process.env.CODEX_WEB_TEST_PERSIST_THREADS === "1";
 const testDesktopStateFile = testMode && process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE ? path.resolve(process.env.CODEX_WEB_TEST_DESKTOP_STATE_FILE) : "";
 const testDropTurnCompleted = testMode && process.env.CODEX_WEB_TEST_DROP_TURN_COMPLETED === "1";
 const defaultFullAccess = process.env.CODEX_WEB_DEFAULT_FULL_ACCESS !== "0";
@@ -56,6 +92,17 @@ process.on("uncaughtException", (error) => {
   console.error("uncaught exception", error);
 });
 
+// Record graceful exits/signals. Windows TerminateProcess/Job cleanup bypasses
+// JavaScript handlers entirely; independent startup and process guards protect
+// that case, rather than relying on an exit hook to recover after being killed.
+function logGatewayLifecycle(message) {
+  try { fs.writeSync(2, `${new Date().toISOString()} gateway ${message}\n`); } catch { }
+}
+process.on("exit", (code) => logGatewayLifecycle(`exit code=${code}`));
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
+  try { process.on(signal, () => { logGatewayLifecycle(`received ${signal}`); process.exit(0); }); } catch { }
+}
+
 if (!password || password.length < 8) {
   console.error("CODEX_WEB_PASSWORD must contain at least 8 characters.");
   process.exit(1);
@@ -64,6 +111,10 @@ if (!password || password.length < 8) {
 await fsp.mkdir(dataDir, { recursive: true });
 await fsp.mkdir(uploadDir, { recursive: true });
 await fsp.mkdir(threadSnapshotDir, { recursive: true });
+
+const accessToken = await loadOrCreateAccessToken();
+let publicAddress = { ok: false, url: null, host: null, remotePort: null, serverAddr: null, tunnelName: null, instanceId: null, source: "none", detail: "尚未解析" };
+let publicAddressSyncedUrl = "";
 
 const app = express();
 app.disable("x-powered-by");
@@ -98,6 +149,12 @@ const queueWorkers = new Set();
 const queueRetryTimers = new Map();
 const threadSubmissions = new Set();
 const codex = new CodexClient();
+const threadViews = new ThreadViews();
+const eventEpoch = crypto.randomUUID();
+const submissionFile = path.join(dataDir, 'submissions.json');
+const submissions = new Map(Object.entries(await loadJson(submissionFile, {})));
+const submissionFlights = new Map();
+const sessionPathCache = new Map();
 const terminal = new TerminalSession();
 let terminalControllerToken = null;
 let fullAccess = defaultFullAccess;
@@ -110,6 +167,10 @@ let resetCreditInFlight = false;
 let updateCache = null;
 let eventSeq = 0;
 let desktopConflictCheckInFlight = false;
+let desktopProbeCache = { value: null, at: 0 };
+let desktopProbeInFlight = null;
+let autoPrepareInFlight = false;
+let autoPrepareSuppressedUntil = 0;
 let desktopSessionWatcher = null;
 let sessionIndexWatcher = null;
 let sessionIndexRefreshTimer = null;
@@ -118,6 +179,8 @@ let localSessionUsageCache = null;
 let lastControlAudit = await loadLastJsonLine(controlAuditFile);
 const eventBuffer = [];
 const eventBufferLimit = 1_000;
+const eventByteSizes = [];
+let eventBufferBytes = 0;
 const atomicJsonWrites = new Map();
 const resolvedSessionRoot = path.resolve(sessionRoot);
 const browserGuidedThreads = new Set();
@@ -131,12 +194,16 @@ const browserDeveloperInstructions = [
 setInterval(cleanup, 60_000).unref();
 setInterval(() => broadcast({ type: "heartbeat", data: { at: Date.now() } }, false), 15_000).unref();
 setInterval(() => { if (mode === "web" && codex.ready) for (const threadId of Object.keys(queues)) if (queues[threadId]?.length) scheduleQueue(threadId, 0); }, 3000).unref();
-setInterval(() => { void reconcileDesktopConflict(); }, 5000).unref();
+setInterval(() => { void reconcileDesktopConflict(); }, 15_000).unref();
 // Keep a lightweight account-level sample while the gateway is active. This is
 // deliberately separate from per-turn token events, which only describe work
 // that passed through this gateway.
 setInterval(() => { if (mode === "web" && codex.ready) void sampleAccountUsage(); }, 15 * 60_000).unref();
 setInterval(() => { if (mode === "desktop" && sockets.size) void pollDesktopLiveFiles(); }, 2_500).unref();
+setInterval(() => { void refreshPublicAddress(); }, publicAddressRefreshMs).unref();
+// 88frp rotates node IPs; keep the shared link (and the origin allow-list that
+// reads it) pointing at the current node instead of a dead address.
+void refreshPublicAddress({ force: true });
 startDesktopLiveWatcher();
 startSessionIndexWatcher();
 
@@ -164,6 +231,7 @@ app.post("/api/login", asyncRoute(async (req, res) => {
   await saveSessions();
   res.setHeader("Set-Cookie", cookieHeader(token));
   res.json({ ok: true, version: currentVersion });
+  void autoPrepare("login");
 }));
 
 app.post("/api/logout", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -182,7 +250,7 @@ app.get("/api/session", (req, res) => {
 app.get("/api/control/status", requireAuth, asyncRoute(async (req, res) => {
   const desktop = await inspectDesktopProcesses();
   res.json({
-    mode, transition, takeoverState, fullAccess, terminal: terminal.status(), desktopRunning: desktop.running, desktopProcesses: desktop.processes, codexReady: codex.ready, browser: publicBrowserState(),
+    mode, transition, takeoverState, fullAccess, gatewayPid: process.pid, gatewayParentPid: process.ppid, terminal: terminal.status(), desktopRunning: desktop.running, desktopProcesses: desktop.processes, codexReady: codex.ready, browser: publicBrowserState(), runtime: codex.getRuntimeStatus(),
     controller: mode === "web" || (mode === "terminal" && terminalControllerToken === req.sessionToken),
     controllerBusy: mode === "terminal" && Boolean(terminalControllerToken && terminalControllerToken !== req.sessionToken),
     sharedWebControl: mode === "web",
@@ -208,35 +276,85 @@ app.post("/api/control/takeover", requireAuth, requireSameOrigin, asyncRoute(asy
     await recordControlAudit("takeover-shared", req);
     return res.json({ ok: true, alreadyControlled: true, shared: true });
   }
-  transition = true; setTakeoverState("checking", "正在检查桌面 Codex");
+  const startedAt = Date.now();
+  const timings = {};
+  const step = async (name, timeoutMs, operation) => {
+    const at = Date.now();
+    try { return await withTimeout(Promise.resolve().then(operation), timeoutMs, `${name}超时，请稍后重试`); }
+    finally { timings[name] = Date.now() - at; }
+  };
+  transition = true; takeoverState = { ...takeoverState, auto: false }; setTakeoverState("checking", "正在检查桌面 Codex");
   try {
-    const desktop = await inspectDesktopProcesses();
-    const activity = await inspectDesktopActivity(desktop);
+    // A destructive decision (closing the desktop app) needs a fresh probe, not
+    // the cached one that /api/control/status is served from.
+    const desktop = await step("检查桌面进程", takeoverProbeTimeoutMs, () => inspectDesktopProcesses({ force: true }));
+    const activity = await step("检查桌面任务", takeoverActivityTimeoutMs, () => inspectDesktopActivity(desktop));
     if (activity.running) {
       setTakeoverState("busy", "桌面 Codex 有任务正在运行，请稍后重试", desktop.processes);
-      return res.status(409).json({ error: "桌面 Codex 有任务正在运行，请稍后重试", code: "DESKTOP_BUSY", activity });
+      takeoverState = { ...takeoverState, timings };
+      broadcastState();
+      await recordControlAudit("takeover-busy", req, { durationMs: Date.now() - startedAt, timings, activity });
+      return res.status(409).json({ error: "桌面 Codex 有任务正在运行，请稍后重试", code: "DESKTOP_BUSY", activity, timings });
     }
-    await closeDesktop(true, true, desktop);
+    // Keep exclusive ownership until each operation actually settles. A raced
+    // timeout must never release this lock while an old close/start continues.
+    await recordControlAudit('takeover-before-desktop-close', req, { gatewayPid: process.pid, desktopPids: desktop.processes.map(p => p.pid) });
+    await step("关闭桌面", takeoverCloseTimeoutMs, () => closeDesktop(true, true, desktop));
+    await recordControlAudit('takeover-desktop-closed', req, { gatewayPid: process.pid });
     setTakeoverState("starting", "正在启动 Web Codex 后端");
-    await codex.start();
+    await step("启动后端", takeoverStartTimeoutMs, () => codex.start());
+    if (!codex.ready) throw new Error("Codex 后端启动后未就绪");
     setTakeoverState("browser", "正在验证 Web 浏览器工具");
-    const browser = await refreshBrowserState();
+    const browser = await step("校验浏览器", 5_000, () => refreshBrowserState());
     if (!browser.configured) throw new Error(`Web 浏览器不可用：${browser.message}`);
-    setTakeoverState("verifying", "正在验证任务列表");
-    const probe = await codex.request("thread/list", { limit: 1, sortKey: "recency_at", sortDirection: "desc", archived: false, modelProviders: [], sourceKinds: null });
-    if (!probe || !Array.isArray(probe.data)) throw new Error("Codex 后端健康检查失败");
     terminalControllerToken = null;
     mode = "web";
-    setTakeoverState("ready", "接管成功");
-    await recordControlAudit("takeover-completed", req);
-    res.json({ ok: true });
+    const durationMs = Date.now() - startedAt;
+    setTakeoverState("ready", `接管成功 · 用时 ${(durationMs / 1000).toFixed(1)} 秒`);
+    takeoverState = { ...takeoverState, timings, durationMs };
+    broadcastState();
+    await recordControlAudit("takeover-completed", req, { durationMs, timings });
+    res.json({ ok: true, durationMs, timings });
   } catch (error) {
-    if (codex.ready) await codex.stop().catch(() => {});
+    // A failed start may have armed auto-recovery before becoming ready.
+    // Disarm it too, so a failed takeover cannot later start an orphan backend.
+    await codex.stop().catch(() => {});
+    const durationMs = Date.now() - startedAt;
     setTakeoverState("failed", error.message || "接管失败");
-    mode = (await inspectDesktopProcesses()).running ? "desktop" : "available";
-    await recordControlAudit("takeover-failed", req, { error: error.message || "接管失败" });
+    takeoverState = { ...takeoverState, timings, durationMs, code: error.code || "TAKEOVER_FAILED" };
+    mode = (await inspectDesktopProcesses().catch(() => ({ running: false }))).running ? "desktop" : "available";
+    broadcastState();
+    await recordControlAudit("takeover-failed", req, { error: error.message || "接管失败", code: error.code, durationMs, timings });
     throw error;
   } finally { transition = false; broadcastState(); }
+}));
+
+app.post("/api/control/recover", requireAuth, requireSameOrigin, asyncRoute(async (req, res) => {
+  await recordControlAudit("recover-requested", req);
+  // A crashed desktop app can leave `mode` stuck on "desktop" while nothing is
+  // running; clear that so the phone can take over again.
+  if (mode === "desktop" && !(await inspectDesktopProcesses()).running) { mode = "available"; broadcastState(); }
+  // Recovery may only resurrect a backend this gateway already owns. Starting
+  // one from desktop/available would bypass the takeover checks (closing the
+  // desktop app, activity probe), so those callers must take over instead.
+  const controlsBackend = mode === "web" || (mode === "terminal" && terminalControllerToken === req.sessionToken);
+  if (!controlsBackend) {
+    return res.status(409).json({ error: "请先接管 Codex", code: "TAKEOVER_REQUIRED", mode, codexReady: codex.ready });
+  }
+  if (codex.ready) return res.json({ ok: true, alreadyReady: true, mode, codexReady: true });
+  setTakeoverState("starting", "正在重启 Codex 后端");
+  try {
+    const result = await codex.ensureStarted();
+    await refreshBrowserState().catch(() => null);
+    await recordControlAudit("recover-completed", req, { started: result.started });
+    broadcastState();
+    res.json({ ok: true, restarting: true, started: result.started, mode, codexReady: codex.ready, restart: codex.getRestartStatus() });
+  } catch (error) {
+    setTakeoverState("failed", error.message || "恢复失败");
+    broadcastState();
+    await recordControlAudit("recover-failed", req, { error: error.message || "恢复失败" });
+    throw error;
+  }
 }));
 
 app.post("/api/control/release", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -251,6 +369,7 @@ app.post("/api/control/release", requireAuth, requireController, requireSameOrig
     if (mode === "terminal") terminal.stop(); else await codex.stop();
     fullAccess = defaultFullAccess;
     mode = "desktop";
+    autoPrepareSuppressedUntil = Date.now() + autoPrepareSuppressMs;
     terminalControllerToken = null;
     await launchDesktop(String(req.body?.threadId || lastThreadId || ""));
     await recordControlAudit("release-completed", req);
@@ -264,7 +383,7 @@ app.post("/api/terminal/start", requireAuth, requireSameOrigin, asyncRoute(async
   if (mode === "terminal" && terminalControllerToken && terminalControllerToken !== req.sessionToken) return res.status(409).json({ error: "另一个浏览器正在使用终端" });
   transition = true; setTakeoverState("checking", "正在检查桌面 Codex");
   try {
-    const desktop = await inspectDesktopProcesses();
+    const desktop = await inspectDesktopProcesses({ force: true });
     const activity = await inspectDesktopActivity(desktop);
     if (activity.running) { setTakeoverState("busy", "桌面 Codex 有任务正在运行，请稍后重试", desktop.processes); return res.status(409).json({ error: "桌面 Codex 有任务正在运行，请稍后重试", code: "DESKTOP_BUSY", activity }); }
     await closeDesktop(true, true, desktop);
@@ -320,6 +439,23 @@ app.post("/api/projects", requireAuth, requireSameOrigin, asyncRoute(async (req,
 
   const key = projectPathKey(target);
   const requestedName = String(req.body?.name || "").trim().slice(0, 80);
+  const appProjects = await readAppProjects(codexHomeDir).catch(() => ({ available: false, projects: [] }));
+  if ((mode === "web" && codex.ready) || appProjects.available) {
+    if (mode !== "web" || !codex.ready) return res.status(409).json({ error: "请先接管 Codex，再修改与桌面 App 同步的项目列表" });
+    const projects = await listLiveProjects();
+    let project = projects.find((item) => (item.roots || [item.path]).some((root) => projectPathKey(root) === key));
+    if (project) {
+      if (requestedName && requestedName !== project.name) {
+        const updated = await codex.request("project/update", { projectId: project.id, name: requestedName });
+        project = normalizeAppProject(updated.project || { ...project, name: requestedName });
+      }
+    } else {
+      const idempotencyKey = `web-project-${crypto.createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
+      const created = await codex.request("project/create", { idempotencyKey, name: requestedName || projectDisplayName(target), roots: [{ path: target }], metadata: null });
+      project = normalizeAppProject(created.project);
+    }
+    return res.json({ project });
+  }
   let project = projectStore.projects.find((item) => projectPathKey(item.path) === key);
   if (project) {
     if (requestedName) project.name = requestedName;
@@ -337,6 +473,12 @@ app.delete("/api/projects/:id", requireAuth, requireSameOrigin, asyncRoute(async
   const catalog = await projectCatalog();
   const project = catalog.find((item) => item.id === req.params.id);
   if (!project) return res.status(404).json({ error: "找不到这个项目" });
+  const appProjects = await readAppProjects(codexHomeDir).catch(() => ({ available: false, projects: [] }));
+  if ((mode === "web" && codex.ready) || appProjects.available) {
+    if (mode !== "web" || !codex.ready) return res.status(409).json({ error: "请先接管 Codex，再修改与桌面 App 同步的项目列表" });
+    await codex.request("project/delete", { projectId: project.id });
+    return res.json({ ok: true });
+  }
   const key = projectPathKey(project.path);
   projectStore.projects = projectStore.projects.filter((item) => projectPathKey(item.path) !== key);
   if (!projectStore.hiddenPaths.includes(key)) projectStore.hiddenPaths.push(key);
@@ -378,8 +520,25 @@ app.get("/api/threads", requireAuth, requireWebMode, asyncRoute(async (req, res)
   // The Desktop app-server is authoritative whenever Web control is active.
   // Do not merge old local previews back into this response: that made a
   // Desktop-deleted task reappear in the Web list indefinitely.
-  await replaceThreadCache(result.data);
+  result.data = await replaceThreadCache(result.data);
   res.json(result);
+}));
+
+app.post("/api/threads/:id/rename", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  const threadId = String(req.params.id || "");
+  const name = String(req.body?.name ?? "").trim();
+  if (!threadId) return res.status(400).json({ error: "缺少任务 ID" });
+  if (!name) return res.status(400).json({ error: "任务名称不能为空" });
+  if (name.length > 200) return res.status(400).json({ error: "任务名称不能超过 200 个字符" });
+  await codex.request("thread/name/set", { threadId, name });
+  let thread = null;
+  try {
+    const result = await codex.request("thread/read", { threadId, includeTurns: false });
+    thread = normalizeThread(result.thread);
+    await mergeThreadCache(thread);
+  } catch { }
+  broadcast({ type: "threadIndexChanged", data: { at: Date.now(), threadId, name } });
+  res.json({ ok: true, threadId, name, thread });
 }));
 
 app.post("/api/threads/:id/archive", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -409,7 +568,7 @@ app.post("/api/threads", requireAuth, requireController, requireSameOrigin, asyn
   let stat;
   try { stat = await fsp.stat(cwd); } catch { return res.status(404).json({ error: "项目文件夹不存在，请重新添加" }); }
   if (!stat.isDirectory()) return res.status(400).json({ error: "项目路径不是文件夹" });
-  const params = { cwd, ...(testMode ? { ephemeral: true } : {}), ...threadStartOverrides(req.body), ...threadPermissionOverrides() };
+  const params = { cwd, ...(testMode && !persistTestThreads ? { ephemeral: true } : {}), ...threadStartOverrides(req.body), ...threadPermissionOverrides() };
   const result = await codex.request("thread/start", params);
   if (result.thread?.id) { lastThreadId = result.thread.id; await mergeThreadCache(result.thread, { localDraft: testMode }); }
   res.json(result);
@@ -506,16 +665,85 @@ app.get("/api/threads/:id/snapshot", requireAuth, asyncRoute(async (req, res) =>
   const thread = cachedIsFresh ? cached.thread : await readReadonlyThreadSingleFlight(req.params.id);
   if (!thread) return res.status(404).json({ error: "暂时没有该任务的本地快照" });
   if (!cachedIsFresh) void writeThreadSnapshot(thread).catch(() => {});
-  res.json({ thread, cached: cachedIsFresh, cachedAt: cachedIsFresh ? cached?.cachedAt || null : null, ...threadRuntimePayload(req.params.id) });
+  res.json({ thread, cached: cachedIsFresh, cachedAt: cachedIsFresh ? cached?.cachedAt || null : null, ...threadRuntimePayload(req.params.id, thread) });
+}));
+
+async function readableThread(id) {
+  const local = await readReadonlyThreadSingleFlight(id);
+  if (local) return local;
+  const saved = await readThreadSnapshot(id);
+  if (saved?.thread) return saved.thread;
+  if (codex.ready) {
+    try { return (await codex.request('thread/read', { threadId: id, includeTurns: true })).thread; }
+    catch (error) {
+      if (/not materialized|before first user message/i.test(error.message)) return (await codex.request('thread/read', { threadId: id, includeTurns: false })).thread;
+      if (!/no rollout found|thread not found|thread not loaded/i.test(error.message)) throw error;
+    }
+  }
+  return null;
+}
+app.get('/api/v2/threads/:id/view', requireAuth, asyncRoute(async (req, res) => {
+  const thread = await readableThread(req.params.id);
+  if (!thread) return res.status(404).json({ error: '尚无此任务的历史记录' });
+  const viewThread = { ...thread, ...normalizeThread(thread) };
+  const stamp = await sessionStamp(req.params.id);
+  const revision = stamp ? `${stamp.size}:${stamp.mtimeMs}` : `memory:${thread.turns?.length || 0}`;
+  const result = threadViews.page(viewThread, { before: req.query.before, limit: req.query.limit, revision, epoch: eventEpoch });
+  const runtime = threadRuntimePayload(req.params.id, viewThread);
+  if (runtime.turnDiff?.diff?.length > 6000) runtime.turnDiff = { ...runtime.turnDiff, diff: `${runtime.turnDiff.diff.slice(0, 6000)}\n…完整文件变更请展开对应卡片…` };
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ...result, ...runtime, activeTurnId: activeTurns.get(req.params.id) || null });
+}));
+app.get('/api/v2/threads/:id/items/:itemId', requireAuth, asyncRoute(async (req, res) => {
+  let item = threadViews.details.get(`${req.params.id}:${req.params.itemId}`);
+  if (!item) {
+    const thread = await readableThread(req.params.id);
+    for (const turn of thread?.turns || []) {
+      item = turn.items?.find((entry, i) => String(entry.id || `${turn.id || 'turn'}:${i}`) === req.params.itemId);
+      if (item) break;
+    }
+  }
+  if (!item) return res.status(404).json({ error: '详细内容暂不可用，请刷新任务' });
+  res.json({ item });
+}));
+app.get('/api/v2/threads/:id/assets/:assetId', requireAuth, (req, res) => {
+  const asset = threadViews.assets.get(req.params.assetId);
+  if (!asset || asset.threadId !== req.params.id) return res.status(404).end();
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,(.*)$/is.exec(asset.value);
+  if (!match || /svg/i.test(match[1])) return res.status(415).end();
+  res.setHeader('Cache-Control', 'private, max-age=600');
+  res.type(match[1]).send(Buffer.from(match[2], 'base64'));
+});
+app.get('/api/v2/threads/:id/agents', requireAuth, asyncRoute(async (req, res) => {
+  const thread = await readableThread(req.params.id);
+  const agents = relatedAgentIds(thread);
+  if (codex.ready) {
+    try {
+      const children = await codex.request('thread/list', { limit: 100, sortKey: 'recency_at', sortDirection: 'desc', archived: false, modelProviders: [], sourceKinds: null, parentThreadId: req.params.id });
+      for (const child of children?.data || []) {
+        const spawn = child.source?.subAgent?.thread_spawn || {};
+        const name = spawn.agent_path || child.agentNickname || child.name || child.preview || String(child.id).slice(0, 12);
+        agents.push({ id: String(child.id), name, model: child.model || '', status: child.status?.type === 'active' ? 'inProgress' : child.status?.type || spawn.status || 'unknown', updatedAt: child.updatedAt || child.recencyAt || 0 });
+      }
+    } catch { }
+  }
+  // Actual child rollout metadata is authoritative; paths are never accepted from the browser.
+  for (const entry of await readThreadPreviews()) {
+    if (entry.id === req.params.id) continue;
+    const meta = await readSessionMetadata(entry.id);
+    if (meta.parentThreadId === req.params.id && !agents.some((a) => a.id === entry.id)) agents.push({ id: entry.id, name: entry.preview, model: meta.model || '', status: activeTurns.has(entry.id) ? 'inProgress' : 'unknown' });
+  }
+  res.json({ data: [...new Map(agents.map((agent) => [String(agent.id), agent])).values()] });
 }));
 
 app.get("/api/threads/:id", requireAuth, requireWebMode, asyncRoute(async (req, res) => {
   const result = await activateThread(req.params.id);
   lastThreadId = req.params.id;
-  await mergeThreadCache(result.thread);
-  syncThreadRuntime(result.thread);
-  void writeThreadSnapshot(result.thread).catch(() => {});
-  res.json({ ...result, ...threadRuntimePayload(req.params.id) });
+  const viewThread = { ...result.thread, ...normalizeThread(result.thread) };
+  await mergeThreadCache(viewThread);
+  syncThreadRuntime(viewThread);
+  void writeThreadSnapshot(viewThread).catch(() => {});
+  res.json({ ...result, thread: viewThread, ...threadRuntimePayload(req.params.id, viewThread) });
 }));
 
 app.get("/api/thread-previews/:id", requireAuth, asyncRoute(async (req, res) => {
@@ -525,37 +753,87 @@ app.get("/api/thread-previews/:id", requireAuth, asyncRoute(async (req, res) => 
 }));
 
 app.post("/api/threads/:id/messages", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  const clientMessageId = /^[a-zA-Z0-9_-]{8,100}$/.test(String(req.body?.clientMessageId || '')) ? req.body.clientMessageId : crypto.randomUUID();
+  const receiptKey = submissionKey(req, clientMessageId);
+  const existing = submissions.get(receiptKey);
+  const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ text: req.body?.text, attachments: req.body?.attachmentIds, mode: req.body?.mode })).digest('hex');
+  if (existing) {
+    if (existing.fingerprint !== fingerprint) return res.status(409).json({ error: '消息编号已用于不同内容' });
+    if (existing.status === 'accepted') return res.json(existing.result);
+    if (submissionFlights.has(receiptKey)) return res.json(await submissionFlights.get(receiptKey));
+    return res.status(409).json({ error: '这条消息的提交结果待核对，暂未重复发送', code: 'SUBMISSION_UNCERTAIN', clientMessageId });
+  }
   const text = String(req.body?.text || "").trim();
   const modeRequested = String(req.body?.mode || "auto");
   const input = await buildInput(text, req.body?.attachmentIds || [], req.sessionToken);
   if (!input.length) return res.status(400).json({ error: "消息或附件不能为空" });
+  const receipt = { status: 'pending', fingerprint, at: Date.now(), threadId: req.params.id, clientMessageId };
+  submissions.set(receiptKey, receipt); await saveSubmissions();
+  let resolveFlight, rejectFlight;
+  const flight = new Promise((resolve, reject) => { resolveFlight = resolve; rejectFlight = reject; }); flight.catch(() => {});
+  submissionFlights.set(receiptKey, flight);
+  const accept = async (result) => { const value = { ...result, clientMessageId }; Object.assign(receipt, { status: 'accepted', result: value }); await saveSubmissions(); resolveFlight(value); res.json(value); };
+  try {
   const threadId = req.params.id;
   const activeTurnId = activeTurns.get(threadId);
   const submissionPending = threadSubmissions.has(threadId);
   lastThreadId = threadId;
 
   if (modeRequested === "queue" || (modeRequested === "auto" && (activeTurnId || submissionPending))) {
-    const item = { id: crypto.randomUUID(), text, input, createdAt: Date.now(), settings: turnOverrides(req.body) };
+    const item = { id: clientMessageId, text, input, clientMessageId, createdAt: Date.now(), settings: turnOverrides(req.body) };
     (queues[threadId] ||= []).push(item); await saveQueues(); broadcastQueue(threadId);
     if (!activeTurnId) scheduleQueue(threadId, 50);
-    return res.json({ queued: true, item });
+    return await accept({ queued: true, item });
   }
   if (modeRequested === "steer") {
-    if (!activeTurnId) return res.status(409).json({ error: "当前没有可引导的运行任务" });
-    return res.json(await codex.request("turn/steer", {
-      threadId, expectedTurnId: activeTurnId, input, clientUserMessageId: crypto.randomUUID(),
+    if (!activeTurnId) throw httpError(409, '当前没有可引导的运行任务');
+    return await accept(await codex.request("turn/steer", {
+      threadId, expectedTurnId: activeTurnId, input, clientUserMessageId: clientMessageId,
     }));
   }
   threadSubmissions.add(threadId);
   try {
     await resumeThread(threadId);
-    const result = await codex.request("turn/start", { threadId, input, clientUserMessageId: crypto.randomUUID(), ...turnOverrides(req.body), ...turnPermissionOverrides() });
+    const result = await codex.request("turn/start", { threadId, input, clientUserMessageId: clientMessageId, ...turnOverrides(req.body), ...turnPermissionOverrides() });
     if (result.turn?.id) activeTurns.set(threadId, result.turn.id);
-    res.json(result);
+    await accept(result);
   } finally {
     threadSubmissions.delete(threadId);
     if (!activeTurns.has(threadId) && queues[threadId]?.length) scheduleQueue(threadId, 50);
   }
+  } catch (error) {
+    // An upstream acceptance must survive a later disk/HTTP delivery failure.
+    receipt.status = receipt.result ? 'accepted' : /timeout|stopped|closed|EPIPE|connection/i.test(error.message) ? 'unknown' : 'failed';
+    receipt.error = String(error.message).slice(0, 300);
+    await saveSubmissions().catch(() => {}); rejectFlight(error); throw error;
+  } finally { submissionFlights.delete(receiptKey); }
+}));
+
+function submissionKey(req, id) { return `${crypto.createHash('sha256').update(req.sessionToken || '').digest('hex').slice(0, 20)}:${req.params.id}:${id}`; }
+async function saveSubmissions() {
+  for (const [key, value] of submissions) if (Date.now() - value.at > 7 * 86400_000) submissions.delete(key);
+  while (submissions.size > 1500) submissions.delete(submissions.keys().next().value);
+  await atomicJson(submissionFile, Object.fromEntries(submissions));
+}
+app.get('/api/threads/:id/submissions/:messageId', requireAuth, (req, res) => {
+  const receipt = submissions.get(submissionKey(req, req.params.messageId));
+  res.json(receipt ? { status: receipt.status, result: receipt.result, error: receipt.error } : { status: 'unknown' });
+});
+app.patch('/api/threads/:id/queue/:itemId', requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
+  if (queueWorkers.has(req.params.id)) return res.status(409).json({ error: '队列正在发送，请稍后修改' });
+  const item = queues[req.params.id]?.find((entry) => entry.id === req.params.itemId);
+  if (!item) return res.status(404).json({ error: '这条消息已发送或已移除' });
+  const text = String(req.body?.text || '').trim();
+  if (!text || text.length > 50_000) return res.status(400).json({ error: '请输入有效消息（不超过50000字）' });
+  const originalText = item.text || '';
+  const textEntry = item.input.find((entry) => entry.type === 'text');
+  // buildInput includes non-image attachment paths after the user's text.
+  // Editing a queued message must preserve that suffix and image entries.
+  const suffix = textEntry?.text?.startsWith(originalText) ? textEntry.text.slice(originalText.length) : textEntry?.text || '';
+  if (textEntry) textEntry.text = text + suffix;
+  else item.input.unshift({ type: 'text', text });
+  item.text = text;
+  await saveQueues(); broadcastQueue(req.params.id); res.json({ ok: true, item });
 }));
 
 app.post("/api/threads/:id/interrupt", requireAuth, requireController, requireSameOrigin, asyncRoute(async (req, res) => {
@@ -644,6 +922,28 @@ app.post("/api/approvals/:id", requireAuth, requireController, requireSameOrigin
   res.json({ ok: true, response });
 }));
 
+app.get("/api/public-link", (req, res) => {
+  // The access token is deliberately NOT returned here: frpc reaches this
+  // gateway from 127.0.0.1, so a socket-address loopback check cannot tell a
+  // local caller from a tunnelled one. The token lives only in the launcher
+  // settings file and this process's data directory.
+  if (!isLoopbackRequest(req)) return res.status(403).json({ error: "仅限本机访问" });
+  res.json({ ...publicAddress, version: currentVersion, tokenized: Boolean(publicAddress?.url) });
+});
+
+// Password-less entry: /?t=<accessToken> (or /auth?t=...) exchanges the token
+// for a long-lived cookie, so scanning the tray QR logs a phone straight in.
+app.get(["/", "/auth"], asyncRoute(async (req, res, next) => {
+  const token = String(req.query.t || "");
+  if (!token) return next();
+  if (!safeEqual(token, accessToken)) return res.status(401).type("text/plain").send("访问令牌无效，请在主机托盘重新获取二维码。");
+  const session = crypto.randomBytes(32).toString("base64url");
+  sessions.set(sessionKey(session), { expiresAt: Date.now() + accessSessionMs });
+  await saveSessions();
+  res.setHeader("Set-Cookie", cookieHeader(session, Math.floor(accessSessionMs / 1000)));
+  res.redirect(302, "/");
+}));
+
 app.use(express.static(path.join(root, "public"), {
   index: "index.html",
   maxAge: 0,
@@ -655,7 +955,7 @@ app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
   const status = error.type === "entity.too.large" ? 413 : (Number(error.status) || Number(error.statusCode) || 500);
   if (status >= 500) console.error(error);
-  res.status(status).json({ error: error.type === "entity.too.large" ? "文件太大" : (error.message || "服务器错误") });
+  res.status(status).json({ error: error.type === "entity.too.large" ? "文件太大" : (error.message || "服务器错误"), ...(['WEB_HOSTED_BY_DESKTOP','WEB_PROCESS_GUARD_UNAVAILABLE','DESKTOP_PROCESS_CHANGED'].includes(error.code) ? { code: error.code } : {}) });
 });
 
 const server = app.listen(port, host, async () => {
@@ -674,15 +974,26 @@ server.on("upgrade", (req, socket, head) => {
 });
 wss.on("connection", (ws, req) => {
   sockets.add(ws);
-  broadcastState();
+  // Half-open detection: the browser answers protocol-level pings by itself,
+  // so a socket that stops answering is dead even when TCP has not noticed.
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("message", (raw) => {
+    let message; try { message = JSON.parse(String(raw)); } catch { return; }
+    if (message?.type === "ping") safeWsSend(ws, { type: "pong", data: { ts: message.data?.ts ?? null, serverTs: Date.now() } });
+  });
   const requestUrl = new URL(req.url || "/events", "http://localhost");
   const since = Math.max(0, Number(requestUrl.searchParams.get("since") || 0) || 0);
   const oldest = eventBuffer[0]?.seq ?? (eventSeq + 1);
   const replayAvailable = since === 0 || (since <= eventSeq && since >= oldest - 1);
-  safeWsSend(ws, { type: "hello", data: { eventSeq, replayAvailable, oldestEventSeq: oldest } });
+  safeWsSend(ws, { type: "hello", data: { epoch: eventEpoch, eventSeq, replayAvailable, oldestEventSeq: oldest, serverVersion: currentVersion } });
   if (replayAvailable && since > 0) for (const event of eventBuffer) if (event.seq > since) safeWsSend(ws, event);
+  broadcastState();
   ws.on("error", () => { sockets.delete(ws); });
   ws.on("close", () => { sockets.delete(ws); broadcastState(); });
+  // A browser that just authenticated is about to be used; warm the backend now
+  // so the first message does not pay the startup cost.
+  void autoPrepare("ws-connect");
 });
 terminalWss.on("connection", (ws, req) => {
   if (terminalControllerToken !== req.sessionToken || mode !== "terminal") return ws.close(1008, "No terminal control");
@@ -694,11 +1005,20 @@ terminalWss.on("connection", (ws, req) => {
 terminal.on("data", (data) => { for (const ws of terminalWss.clients) safeWsSend(ws, { type: "data", data }); });
 terminal.on("exit", (data) => { for (const ws of terminalWss.clients) safeWsSend(ws, { type: "exit", data }); });
 
+setInterval(() => {
+  for (const ws of sockets) {
+    if (ws.isAlive === false) { try { ws.terminate(); } catch { } sockets.delete(ws); continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { }
+  }
+}, 25_000).unref();
+
 codex.on("notification", (data) => {
   const { method, params } = data;
   const threadId = params?.threadId || params?.thread?.id || params?.turn?.threadId || params?.turn?.thread_id;
   const dropTurnCompleted = method === "turn/completed" && testDropTurnCompletedRemaining > 0;
   if (dropTurnCompleted) testDropTurnCompletedRemaining -= 1;
+  if (method === 'thread/name/updated' && threadId) broadcast({ type: 'threadIndexChanged', data: { at: Date.now(), threadId } });
   if (method === "serverRequest/resolved" && params?.requestId != null) pendingApprovals.delete(String(params.requestId));
   if (method === "thread/settings/updated" && threadId && params.threadSettings) threadSettings.set(threadId, params.threadSettings);
   if (method === "thread/tokenUsage/updated" && threadId && params.tokenUsage) {
@@ -719,7 +1039,7 @@ codex.on("notification", (data) => {
   }
   if (method === "item/started" && threadId) {
     const item = params.item || {};
-    const labels = { reasoning: ["thinking", "正在思考"], commandExecution: ["command", "正在执行命令"], fileChange: ["file", "正在修改文件"], webSearch: ["search", "正在搜索"], mcpToolCall: ["tool", "正在调用工具"], dynamicToolCall: ["tool", "正在调用工具"], imageGeneration: ["image", "正在生成图片"] };
+    const labels = { reasoning: ["thinking", "正在思考"], commandExecution: ["command", "正在执行命令"], fileChange: ["file", "正在修改文件"], webSearch: ["search", "正在搜索"], mcpToolCall: ["tool", "正在调用工具"], dynamicToolCall: ["tool", "正在调用工具"], collabAgentToolCall: ["agent", "正在协调子智能体"], subAgentActivity: ["agent", "子智能体正在工作"], imageGeneration: ["image", "正在生成图片"] };
     const browserTool = item.type === "mcpToolCall" && /^(browser_|playwright\b)/i.test(String(item.tool || item.toolName || item.name || ""));
     if (browserTool) markBrowserVerified();
     const [phase, defaultLabel] = labels[item.type] || ["working", "正在处理"];
@@ -736,7 +1056,13 @@ codex.on("notification", (data) => {
     void mergeThreadSnapshotTurn(threadId, params.turn).catch(() => {});
     scheduleQueue(threadId, 120);
   }
-  broadcast({ type: "notification", data });
+  // Wire notifications carry the same bounded read model as initial pages.
+  // Large tool output and inline images remain accessible via detail/assets.
+  let wireParams = params;
+  if (threadId && params?.item) wireParams = { ...params, item: threadViews.compact(params.item, threadId) };
+  if (threadId && params?.turn?.items) wireParams = { ...wireParams, turn: { ...params.turn, items: params.turn.items.slice(-60).map((item) => threadViews.compact(item, threadId)) } };
+  if (threadId && params?.thread?.turns) wireParams = { ...wireParams, thread: threadViews.page(params.thread).thread };
+  broadcast({ type: "notification", data: { ...data, params: wireParams } });
 });
 codex.on("serverRequest", handleServerRequest);
 codex.on("stderr", (chunk) => {
@@ -766,7 +1092,7 @@ async function processQueue(threadId) {
     }
     setThreadActivity(threadId, "queue", "正在发送下一条排队消息");
     await resumeThread(threadId);
-    const result = await codex.request("turn/start", { threadId, input: item.input, clientUserMessageId: crypto.randomUUID(), ...(item.settings || {}), ...turnPermissionOverrides() });
+    const result = await codex.request("turn/start", { threadId, input: item.input, clientUserMessageId: item.clientMessageId || item.id, ...(item.settings || {}), ...turnPermissionOverrides() });
     if (!result.turn?.id) throw new Error("Codex 未返回新任务 ID");
     activeTurns.set(threadId, result.turn.id);
     queues[threadId] = (queues[threadId] || []).filter((entry) => entry.id !== item.id);
@@ -792,9 +1118,18 @@ function scheduleQueue(threadId, delayMs = 100) {
   queueRetryTimers.set(threadId, timer);
 }
 
-function threadRuntimePayload(threadId) {
+function threadRuntimePayload(threadId, thread = null) {
+  const fallback = thread ? {
+    model: thread.model || '',
+    effort: thread.reasoningEffort || thread.effort || '',
+    summary: thread.summary || '',
+    multiAgentMode: thread.multiAgentMode || '',
+    multiAgentVersion: thread.multiAgentVersion || '',
+  } : {};
+  const merged = { ...fallback, ...(threadSettings.get(threadId) || {}) };
+  for (const key of Object.keys(merged)) if (!merged[key]) delete merged[key];
   return {
-    threadSettings: threadSettings.get(threadId) || null,
+    threadSettings: Object.keys(merged).length ? merged : null,
     tokenUsage: threadTokenUsage.get(threadId) || null,
     turnPlan: turnPlans.get(threadId) || null,
     turnDiff: turnDiffs.get(threadId) || null,
@@ -931,6 +1266,52 @@ async function buildInput(text, attachmentIds, ownerToken = "") {
   return input;
 }
 
+function appTimestampMs(value) {
+  if (value == null || value === '') return 0;
+  const number = Number(value);
+  if (Number.isFinite(number) && number > 0) return number < 10_000_000_000 ? number * 1000 : number;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeAppProject(project = {}) {
+  const roots = (Array.isArray(project.roots) ? project.roots : [])
+    .map((root) => normalizeProjectPath(typeof root === 'string' ? root : root?.path || ''))
+    .filter(Boolean);
+  const primaryPath = roots[0] || '';
+  return {
+    id: String(project.id || crypto.randomUUID()),
+    name: String(project.name || projectDisplayName(primaryPath) || '未命名项目'),
+    path: primaryPath,
+    roots,
+    metadata: project.metadata && typeof project.metadata === 'object' ? project.metadata : {},
+    position: Number(project.position || 0),
+    recencyAt: appTimestampMs(project.recencyAt) || null,
+    createdAt: appTimestampMs(project.createdAt),
+    updatedAt: appTimestampMs(project.updatedAt),
+    saved: true,
+    source: 'app',
+  };
+}
+
+async function listLiveProjects(limit = 200) {
+  const data = [];
+  let cursor = null;
+  while (data.length < limit) {
+    const page = await codex.request('project/list', {
+      ...(cursor ? { cursor } : {}),
+      limit: Math.min(100, limit - data.length),
+      sortKey: 'position',
+      sortDirection: 'asc',
+    });
+    const rows = Array.isArray(page?.data) ? page.data : [];
+    data.push(...rows.map(normalizeAppProject));
+    if (!page?.nextCursor || !rows.length) break;
+    cursor = page.nextCursor;
+  }
+  return data;
+}
+
 async function listLiveThreads(limit = 100) {
   const data = [];
   let cursor = null;
@@ -991,6 +1372,16 @@ async function forgetThreadLocally(threadId) {
 }
 async function saveQueues() { await atomicJson(queueFile, queues); }
 
+async function applyAppThreadTitles(records, { force = false } = {}) {
+  const titles = await readAppThreadTitles(codexHomeDir, { force, cacheMs: appTitleCacheMs }).catch(() => new Map());
+  if (!titles.size) return records;
+  return records.map((record) => {
+    const row = titles.get(String(record.id || ''));
+    if (!row) return record;
+    return normalizeThread({ ...record, name: row.title, preview: row.title, updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : record.updatedAt });
+  });
+}
+
 async function readThreadPreviews() {
   const merged = new Map();
   for (const thread of await loadJson(threadCacheFile, [])) if (thread?.id) merged.set(thread.id, normalizeThread(thread));
@@ -1005,7 +1396,9 @@ async function readThreadPreviews() {
       } catch { }
     }
   } catch { }
-  const previews = [...merged.values()].sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 100);
+  let previews = await applyAppThreadTitles([...merged.values()]);
+  previews.sort((a, b) => threadTime(b) - threadTime(a));
+  previews = previews.slice(0, 100);
   // session_index.jsonl intentionally stores only a title and timestamp.
   // Resolve missing cwd from the session metadata so a valid Desktop task is
   // not incorrectly hidden by the selected Web project filter.
@@ -1022,46 +1415,76 @@ async function readReadonlyThread(threadId) {
   if (!file) return null;
   const stat = await fsp.stat(file);
   const cached = readonlyThreadCache.get(threadId);
-  if (cached?.size === stat.size && cached?.mtimeMs === stat.mtimeMs) return cached.thread;
+  if (cached?.size === stat.size && cached?.mtimeMs === stat.mtimeMs) {
+    if (preview?.preview) cached.thread.preview = preview.preview;
+    return cached.thread;
+  }
 
-  const turns = [];
-  const turnMap = new Map();
-  let currentTurnId = null;
-  let cwd = preview?.cwd || "";
-  let model = "";
-  const responseCallItems = new Map();
-  const stream = fs.createReadStream(file, { encoding: "utf8" });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const append = cached?.file === file && cached.size < stat.size && cached.birthtimeMs === stat.birthtimeMs;
+  const turns = append ? cached.thread.turns : [];
+  const turnMap = append ? cached.turnMap : new Map();
+  let currentTurnId = append ? cached.currentTurnId : null;
+  let cwd = append ? cached.thread.cwd : preview?.cwd || "";
+  let model = append ? cached.thread.model : "";
+  let reasoningEffort = append ? cached.thread.reasoningEffort : '';
+  let summary = append ? cached.thread.summary : '';
+  let multiAgentMode = append ? cached.thread.multiAgentMode : '';
+  let multiAgentVersion = append ? cached.thread.multiAgentVersion : '';
+  const responseCallItems = append ? cached.responseCallItems : new Map();
   const ensureTurn = (id) => {
     const key = id || currentTurnId || `readonly-${turns.length}`;
     if (!turnMap.has(key)) { const turn = { id: key, items: [] }; turnMap.set(key, turn); turns.push(turn); }
     return turnMap.get(key);
   };
-  for await (const line of lines) {
+  const processLine = (line) => {
     let record;
-    try { record = JSON.parse(line); } catch { continue; }
+    try { record = JSON.parse(line); } catch { return; }
     const payload = record?.payload || {};
     if (record.type === "session_meta") cwd ||= payload.cwd || "";
     if (record.type === "turn_context") {
       currentTurnId = payload.turn_id || currentTurnId;
       cwd = payload.cwd || cwd;
       model = payload.model || model;
+      reasoningEffort = payload.effort || payload.reasoning_effort || reasoningEffort;
+      summary = payload.summary || summary;
+      multiAgentMode = payload.multi_agent_mode || multiAgentMode;
+      multiAgentVersion = payload.multi_agent_version || multiAgentVersion;
       ensureTurn(currentTurnId);
-      continue;
+      return;
     }
     if (record.type === "response_item") {
       appendReadonlyResponseItem(ensureTurn(currentTurnId), payload, responseCallItems);
-      continue;
+      return;
     }
-    if (record.type !== "event_msg") continue;
-    if (payload.type === "task_started") { currentTurnId = payload.turn_id || currentTurnId; ensureTurn(currentTurnId); continue; }
+    if (record.type !== "event_msg") return;
+    if (payload.type === "task_started") { currentTurnId = payload.turn_id || currentTurnId; ensureTurn(currentTurnId).status = 'inProgress'; return; }
     const turn = ensureTurn(payload.turn_id || currentTurnId);
+    if (['task_complete', 'turn_aborted', 'task_failed'].includes(payload.type)) { turn.status = payload.type === 'task_complete' ? 'completed' : 'interrupted'; return; }
     if (payload.type === "user_message") appendReadonlyItem(turn, { type: "userMessage", content: [{ type: "text", text: payload.message || "" }] });
     else if (payload.type === "agent_message") appendReadonlyItem(turn, { type: "agentMessage", text: payload.message || "", phase: payload.phase });
     else if (payload.type === "agent_reasoning") appendReadonlyItem(turn, { type: "reasoning", summary: payload.text || "", status: "completed" });
+    else if (payload.type === 'sub_agent_activity' || payload.type === 'subAgentActivity') appendReadonlyItem(turn, { ...payload, type: 'subAgentActivity' });
+  };
+  let carry = append ? cached.carry : Buffer.alloc(0);
+  const stream = fs.createReadStream(file, { start: append ? cached.size : 0, end: Math.max(0, stat.size - 1) });
+  if (stat.size > 0) for await (const chunk of stream) {
+    const buffer = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    let start = 0;
+    for (let at = buffer.indexOf(10); at >= 0; at = buffer.indexOf(10, start)) {
+      processLine(buffer.subarray(start, at).toString('utf8'));
+      start = at + 1;
+    }
+    carry = buffer.subarray(start);
   }
-  const thread = { id: threadId, preview: preview?.preview || "未命名任务", cwd, model, turns };
-  readonlyThreadCache.set(threadId, { size: stat.size, mtimeMs: stat.mtimeMs, thread });
+  const active = turns.at(-1)?.status === 'inProgress' && Date.now() - stat.mtimeMs < 180_000;
+  const thread = { id: threadId, preview: preview?.preview || "未命名任务", cwd, model, turns, status: { type: active ? 'active' : 'idle' } };
+  thread.name = thread.name || thread.preview;
+  thread.reasoningEffort = reasoningEffort;
+  thread.summary = summary;
+  thread.multiAgentMode = multiAgentMode;
+  thread.multiAgentVersion = multiAgentVersion;
+  readonlyThreadCache.set(threadId, { file, birthtimeMs: stat.birthtimeMs, size: stat.size, mtimeMs: stat.mtimeMs, thread, turnMap, currentTurnId, responseCallItems, carry });
+  while (readonlyThreadCache.size > 10) readonlyThreadCache.delete(readonlyThreadCache.keys().next().value);
   return thread;
 }
 
@@ -1078,12 +1501,13 @@ function appendReadonlyItem(turn, item) {
   const previous = turn.items.at(-1);
   if (item.type === "agentMessage" && previous?.type === "agentMessage" && String(previous.text || "") === String(item.text || "")) return previous;
   if (item.type === "reasoning" && previous?.type === "reasoning" && String(previous.summary || "") === String(item.summary || "")) return previous;
+  item.id ||= `readonly:${turn.id}:${turn.items.length}`;
   turn.items.push(item);
   return item;
 }
 
 function appendReadonlyResponseItem(turn, payload = {}, callItems = new Map()) {
-  const id = String(payload.id || payload.call_id || crypto.randomUUID());
+  const id = String(payload.id || payload.call_id || `readonly:${turn.id}:${turn.items.length}`);
   if (payload.type === "message" && payload.role === "assistant") {
     const text = responseContentText(payload);
     if (text) appendReadonlyItem(turn, { id, type: "agentMessage", text, phase: payload.phase });
@@ -1137,6 +1561,8 @@ function parseMaybeJson(value) {
 }
 
 async function findSessionFile(threadId) {
+  const known = sessionPathCache.get(threadId);
+  if (known && await fsp.stat(known).then(() => true, () => false)) return known;
   const suffix = `${threadId}.jsonl`;
   const stack = [sessionRoot];
   while (stack.length) {
@@ -1146,7 +1572,7 @@ async function findSessionFile(threadId) {
     for (const entry of entries) {
       const target = path.join(dir, entry.name);
       if (entry.isDirectory()) stack.push(target);
-      else if (entry.isFile() && entry.name.endsWith(suffix)) return target;
+      else if (entry.isFile() && entry.name.endsWith(suffix)) { sessionPathCache.set(threadId, target); return target; }
     }
   }
   return null;
@@ -1156,7 +1582,7 @@ const sessionMetadataCache = new Map();
 async function readSessionMetadata(threadId) {
   const cached = sessionMetadataCache.get(threadId);
   if (cached) return cached;
-  const metadata = { cwd: "" };
+  const metadata = { cwd: "", parentThreadId: '', model: '' };
   const file = await findSessionFile(threadId);
   if (file) {
     const stream = fs.createReadStream(file, { encoding: "utf8", start: 0, end: 256 * 1024 });
@@ -1167,6 +1593,8 @@ async function readSessionMetadata(threadId) {
         try { record = JSON.parse(line); } catch { continue; }
         if (record?.type !== "session_meta") continue;
         metadata.cwd = String(record.payload?.cwd || "");
+        metadata.model = String(record.payload?.model || '');
+        metadata.parentThreadId = record.payload?.source?.subagent?.thread_spawn?.parent_thread_id || record.payload?.source?.subagent?.parent_thread_id || record.payload?.parent_thread_id || '';
         break;
       }
     } finally { lines.close(); stream.destroy(); }
@@ -1292,7 +1720,7 @@ async function syncDesktopLiveFile(file) {
   if (!state) {
     state = await initializeDesktopLiveFile(file);
     const thread = state.threadId ? await readReadonlyThread(state.threadId) : null;
-    if (thread) broadcast({ type: "desktopLive", data: { threadId: state.threadId, kind: "snapshot", thread } });
+    if (thread) broadcast({ type: "threadChanged", data: { threadId: state.threadId } });
     return;
   }
   if (stat.size < state.offset) { state = await initializeDesktopLiveFile(file); return; }
@@ -1348,8 +1776,7 @@ function scheduleDesktopLiveSnapshot(threadId, delayMs = 900) {
     try {
       const thread = await readReadonlyThreadSingleFlight(threadId);
       if (thread) {
-        void writeThreadSnapshot(thread).catch(() => {});
-        broadcast({ type: "desktopLive", data: { threadId, kind: "snapshot", thread } });
+        broadcast({ type: "threadChanged", data: { threadId } });
       }
     } catch { }
   }, delayMs);
@@ -1434,6 +1861,30 @@ function forwardDesktopResponseItem(state, payload = {}) {
 }
 
 function normalizeThread(thread) {
+  const id = String(thread?.id || '');
+  const explicitName = String(thread?.name || thread?.thread_name || '').trim();
+  const messagePreview = String(thread?.messagePreview || thread?.preview || '').trim();
+  const title = explicitName || messagePreview || String(thread?.title || '').trim() || '未命名任务';
+  return {
+    id,
+    name: explicitName || title,
+    preview: title,
+    messagePreview,
+    cwd: thread?.cwd || '',
+    recencyAt: thread?.recencyAt || thread?.recency_at,
+    updatedAt: thread?.updatedAt || thread?.updated_at,
+    createdAt: thread?.createdAt || thread?.created_at,
+    model: thread?.model || '',
+    modelProvider: thread?.modelProvider || thread?.model_provider || '',
+    reasoningEffort: thread?.reasoningEffort || thread?.reasoning_effort || thread?.effort || '',
+    summary: thread?.summary || '',
+    status: thread?.status || null,
+    parentThreadId: thread?.parentThreadId || thread?.parent_thread_id || '',
+    ...(thread?.localDraft ? { localDraft: true } : {}),
+  };
+}
+
+function normalizeThreadLegacy(thread) {
   // App-server preview is a first-message excerpt; name/thread_name is the
   // user-visible task title. Prefer the title so takeover keeps App renames.
   return { id: thread.id, preview: thread.name || thread.thread_name || thread.preview || "未命名任务", cwd: thread.cwd || "", recencyAt: thread.recencyAt, updatedAt: thread.updatedAt || thread.updated_at, createdAt: thread.createdAt, ...(thread.localDraft ? { localDraft: true } : {}) };
@@ -1477,6 +1928,11 @@ function projectDisplayName(value) {
 }
 
 async function projectCatalog() {
+  if (mode === 'web' && codex.ready) {
+    try { return await listLiveProjects(); } catch { }
+  }
+  const appProjects = await readAppProjects(codexHomeDir).catch(() => ({ available: false, projects: [] }));
+  if (appProjects.available) return appProjects.projects;
   const byPath = new Map();
   for (const project of projectStore.projects) byPath.set(projectPathKey(project.path), { ...project, saved: true });
   const hidden = new Set(projectStore.hiddenPaths);
@@ -1504,8 +1960,7 @@ async function catalogThreads() {
     const result = await listLiveThreads(500);
     const drafts = await localDraftThreads();
     for (const draft of drafts) if (!result.data.some((thread) => thread.id === draft.id)) result.data.push(draft);
-    await replaceThreadCache(result.data);
-    return result.data;
+    return await replaceThreadCache(result.data);
   } catch {
     // Losing the live connection should not blank a user's saved project list.
     return readThreadPreviews();
@@ -1736,16 +2191,20 @@ async function sampleAccountUsage() {
 }
 
 function threadTime(thread) {
-  const value = thread.recencyAt || thread.updatedAt || thread.createdAt || 0;
-  if (typeof value === "number") return value < 10_000_000_000 ? value * 1000 : value;
-  return Date.parse(value) || 0;
+  return Math.max(
+    appTimestampMs(thread?.recencyAt),
+    appTimestampMs(thread?.updatedAt),
+    appTimestampMs(thread?.createdAt),
+  );
 }
 
 async function saveThreadCache(threads) {
   const existing = await readThreadPreviews();
   const merged = new Map(existing.map((thread) => [thread.id, thread]));
   for (const thread of threads) if (thread?.id) merged.set(thread.id, normalizeThread({ ...merged.get(thread.id), ...thread }));
-  await atomicJson(threadCacheFile, [...merged.values()].sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 100));
+  const titled = await applyAppThreadTitles([...merged.values()]);
+  const records = titled.sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 100);
+  await atomicJson(threadCacheFile, records);
 }
 
 async function replaceThreadCache(threads) {
@@ -1758,7 +2217,10 @@ async function replaceThreadCache(threads) {
     normalized.push(normalizeThread(thread));
   }
   for (const draft of drafts) if (!seen.has(draft.id)) normalized.push(draft);
-  await atomicJson(threadCacheFile, normalized.sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 500));
+  const titled = await applyAppThreadTitles(normalized);
+  const records = titled.sort((a, b) => threadTime(b) - threadTime(a)).slice(0, 500);
+  await atomicJson(threadCacheFile, records);
+  return records;
 }
 
 async function localDraftThreads() {
@@ -1801,15 +2263,20 @@ async function refreshBrowserState() {
 
 function broadcastState() { broadcast({ type: "control", data: { mode, transition, takeoverState, fullAccess, codexReady: codex.ready, browser: publicBrowserState(), webClientCount: sockets.size, sharedWebControl: mode === "web" } }); }
 function broadcast(message, record = true) {
-  const event = record ? { ...message, seq: ++eventSeq, at: Date.now() } : message;
+  const event = record ? { ...message, epoch: eventEpoch, seq: ++eventSeq, at: Date.now() } : message;
+  const wire = JSON.stringify(event);
   if (record) {
     eventBuffer.push(event);
-    if (eventBuffer.length > eventBufferLimit) eventBuffer.splice(0, eventBuffer.length - eventBufferLimit);
+    const bytes = Buffer.byteLength(wire); eventByteSizes.push(bytes); eventBufferBytes += bytes;
+    while (eventBuffer.length > eventBufferLimit || eventBufferBytes > 8_000_000) { eventBuffer.shift(); eventBufferBytes -= eventByteSizes.shift(); }
   }
-  for (const ws of sockets) safeWsSend(ws, event);
+  for (const ws of sockets) safeWsSend(ws, wire);
 }
 function safeWsSend(ws, message) {
   if (ws.readyState !== 1) return false;
+  // Reconnect + replay is safer than accumulating unbounded output for a slow
+  // mobile/FRP connection. This does not stop the running Codex task.
+  if (ws.bufferedAmount > 2_000_000) { try { ws.close(1013, 'resume required'); } catch {} return false; }
   try {
     ws.send(typeof message === "string" ? message : JSON.stringify(message));
     return true;
@@ -1854,7 +2321,7 @@ function respondToPendingRequest(id, payload) {
 
 function setTakeoverState(phase, message, processes = []) {
   const now = Date.now();
-  takeoverState = { phase, message, startedAt: takeoverState.phase === phase ? takeoverState.startedAt : now, updatedAt: now, processes };
+  takeoverState = { phase, message, startedAt: takeoverState.phase === phase ? takeoverState.startedAt : now, updatedAt: now, processes, auto: Boolean(takeoverState.auto) };
   broadcastState();
 }
 
@@ -1922,6 +2389,55 @@ function applyOfficialThreadStatus(threadId, status) {
   if (flags.has("waitingOnApproval")) return setThreadActivity(threadId, "approval", "等待你批准");
   if (flags.has("waitingOnUserInput")) return setThreadActivity(threadId, "input", "等待你输入");
   if (!threadActivities.has(threadId)) setThreadActivity(threadId, "working", "正在处理");
+}
+
+// Opening the web UI is enough to become usable when the desktop app is not
+// running: there is nothing to arbitrate, so the manual takeover step would be
+// pure latency. When the desktop app IS running the explicit button stays,
+// because taking over would close something of the user's.
+async function autoPrepare(reason = "") {
+  if (!autoPrepareEnabled) return { skipped: "disabled" };
+  if (Date.now() < autoPrepareSuppressedUntil) return { skipped: "released" };
+  if (autoPrepareInFlight || transition) return { skipped: "busy" };
+  if (mode === "terminal") return { skipped: "terminal" };
+  if (mode === "web" && codex.ready) return { skipped: "ready" };
+  autoPrepareInFlight = true;
+  let ownsTransition = false;
+  try {
+    // Fresh probe: this decides whether we may start a backend, and a stale
+    // "not running" would start one right as the user opens the desktop app.
+    const desktop = await inspectDesktopProcesses({ force: true });
+    if (desktop.running) return { skipped: "desktop-running" };
+    if (mode === "desktop") mode = "available";
+    transition = true;
+    ownsTransition = true;
+    takeoverState = { ...takeoverState, auto: true };
+    setTakeoverState("checking", "正在检查桌面 Codex");
+    setTakeoverState("starting", "正在启动 Codex 后端");
+    await codex.start();
+    setTakeoverState("browser", "正在验证 Web 浏览器工具");
+    const browser = await refreshBrowserState();
+    if (!browser.configured) throw new Error(`Web 浏览器不可用：${browser.message}`);
+    setTakeoverState("verifying", "正在验证任务列表");
+    const probe = await codex.request("thread/list", { limit: 1, sortKey: "recency_at", sortDirection: "desc", archived: false, modelProviders: [], sourceKinds: null });
+    if (!probe || !Array.isArray(probe.data)) throw new Error("Codex 后端健康检查失败");
+    terminalControllerToken = null;
+    mode = "web";
+    setTakeoverState("ready", "Codex 已就绪");
+    await recordControlAudit("auto-prepare-completed", null, { reason });
+    return { ok: true };
+  } catch (error) {
+    setTakeoverState("failed", error.message || "自动准备失败");
+    // Do not leave a started backend behind a mode that the UI cannot act on:
+    // a half-prepared state would hide every entry point from the user.
+    if (mode !== "web" && codex.ready) await codex.stop().catch(() => {});
+    await recordControlAudit("auto-prepare-failed", null, { reason, error: error.message || "自动准备失败" }).catch(() => {});
+    return { error: error.message };
+  } finally {
+    if (ownsTransition) transition = false;
+    autoPrepareInFlight = false;
+    broadcastState();
+  }
 }
 
 async function reconcileDesktopConflict() {
@@ -2003,19 +2519,96 @@ async function loadLastJsonLine(file) {
   } catch { return null; }
 }
 
-async function inspectDesktopProcesses() {
+async function inspectDesktopProcesses({ force = false } = {}) {
   if (testMode) {
     if (!testDesktopStateFile) return { running: false, processes: [] };
     const state = await loadJson(testDesktopStateFile, { running: false, processes: [] });
     return { running: Boolean(state.running), processes: Array.isArray(state.processes) ? state.processes : [] };
   }
+  // This probe is on the hot path: every /api/control/status call and the
+  // desktop-conflict reconciler use it. Cache it, collapse concurrent callers
+  // into one probe, and take the cheap tasklist route when nothing matches.
+  if (!force && desktopProbeCache.value && Date.now() - desktopProbeCache.at < desktopProbeTtlMs) return desktopProbeCache.value;
+  if (desktopProbeInFlight) return desktopProbeInFlight;
+  desktopProbeInFlight = (async () => {
+    try {
+      const value = await probeDesktopProcesses();
+      desktopProbeCache = { value, at: Date.now() };
+      return value;
+    } finally {
+      desktopProbeInFlight = null;
+    }
+  })();
+  return desktopProbeInFlight;
+}
+
+async function probeDesktopProcesses() {
+  // WMIC still ships with Windows 10 and most Windows 11 builds. One filtered
+  // call returns the whole desktop tree in ~0.4s, versus ~2.4s for the old
+  // Get-AppxPackage + per-process Get-Process script.
+  try {
+    const output = await runWmic([
+      "process", "where", "name='ChatGPT.exe'",
+      "get", "ProcessId,ParentProcessId,ExecutablePath,CreationDate",
+      "/format:list",
+    ]);
+    const records = parseWmicList(output);
+    if (!records.length) return { running: false, processes: [] };
+    const items = records.map((record) => ({
+      pid: Number(record.ProcessId),
+      parentPid: Number(record.ParentProcessId),
+      name: "ChatGPT.exe",
+      executablePath: String(record.ExecutablePath || ""),
+      main: false,
+      startedAt: parseWmicDate(record.CreationDate),
+    })).filter((item) => Number.isInteger(item.pid) && item.pid > 0
+      && (/OpenAI\.Codex_/i.test(item.executablePath) || /\\OpenAI\\Codex\\/i.test(item.executablePath)));
+    if (items.length) return { running: true, processes: items };
+  } catch { }
+
+  // Windows without wmic: tasklist avoids a PowerShell child when no desktop
+  // process exists, then the fast PowerShell script keeps the positive path
+  // bounded.
+  let listing = "";
+  try { listing = await runTasklist(); } catch { }
+  if (listing && !/ChatGPT\.exe/i.test(listing)) return { running: false, processes: [] };
+  // Fast path: match the official Store package path and every normal dev
+  // install directly. The old script paid for Get-AppxPackage plus one
+  // Get-Process call per child process on every probe (about 2.4s here).
+  const fastScript = `
+$ErrorActionPreference='SilentlyContinue'
+$sessionId=(Get-Process -Id $PID).SessionId
+$items=@(Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe'" | Where-Object {
+  $exe=[string]$_.ExecutablePath; $cmd=[string]$_.CommandLine
+  ($_.SessionId -eq $sessionId) -and (($exe -match 'OpenAI\\.Codex_') -or ($cmd -match 'OpenAI\\.Codex_') -or ($exe -match '\\\\OpenAI\\\\Codex\\\\') -or ($cmd -match '\\\\OpenAI\\\\Codex\\\\'))
+} | ForEach-Object {
+  [pscustomobject]@{
+    pid=[int]$_.ProcessId; parentPid=[int]$_.ParentProcessId; name=$_.Name; executablePath=$_.ExecutablePath;
+    main=([string]$_.CommandLine -notmatch '--type=');
+    startedAt=if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null};
+    command=([string]$_.CommandLine).Substring(0,[Math]::Min(180,([string]$_.CommandLine).Length))
+  }
+})
+[pscustomobject]@{ running=($items.Count -gt 0); processes=$items } | ConvertTo-Json -Depth 4 -Compress`;
+  try {
+    const value = JSON.parse((await runPowerShell(fastScript)).trim() || "{}");
+    const fast = { running: Boolean(value.running), processes: Array.isArray(value.processes) ? value.processes : (value.processes ? [value.processes] : []) };
+    if (fast.running || !listing) return fast;
+  } catch (error) {
+    // Only fall through when tasklist positively saw a ChatGPT.exe. Otherwise
+    // an unrelated PowerShell failure should fail closed instead of pretending
+    // the desktop is absent.
+    if (!listing) throw new Error(`无法检查 Codex 桌面进程：${error.message}`);
+  }
+  // Rare fallback for dev/portable builds outside the two standard paths.
   const script = `
 $ErrorActionPreference='SilentlyContinue'
 $roots=@(Get-AppxPackage -Name 'OpenAI.Codex' | Select-Object -ExpandProperty InstallLocation)
+$sessionId=(Get-Process -Id $PID).SessionId
 $items=@(Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe'" | Where-Object {
   $exe=[string]$_.ExecutablePath; $cmd=[string]$_.CommandLine
-  ($exe -match 'OpenAI\\.Codex_|OpenAI.Codex_') -or ($cmd -match 'OpenAI\\.Codex_|OpenAI.Codex_') -or ($roots | Where-Object { $exe.StartsWith($_,[System.StringComparison]::OrdinalIgnoreCase) -or $cmd.IndexOf($_,[System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
-} | ForEach-Object { $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; [pscustomobject]@{ pid=$_.ProcessId; parentPid=$_.ParentProcessId; name=$_.Name; main=([string]$_.CommandLine -notmatch '--type='); startedAt=if($p){$p.StartTime.ToUniversalTime().ToString('o')}else{$null}; command=([string]$_.CommandLine).Substring(0,[Math]::Min(180,([string]$_.CommandLine).Length)) } })
+  ($_.SessionId -eq $sessionId) -and (($exe -match 'OpenAI\\.Codex_|OpenAI.Codex_') -or ($cmd -match 'OpenAI\\.Codex_|OpenAI.Codex_') -or ($roots | Where-Object { $exe.StartsWith($_,[System.StringComparison]::OrdinalIgnoreCase) -or $cmd.IndexOf($_,[System.StringComparison]::OrdinalIgnoreCase) -ge 0 }))
+} | ForEach-Object { $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; [pscustomobject]@{ pid=$_.ProcessId; parentPid=$_.ParentProcessId; name=$_.Name; executablePath=$_.ExecutablePath; main=([string]$_.CommandLine -notmatch '--type='); startedAt=if($p){$p.StartTime.ToUniversalTime().ToString('o')}else{$null}; command=([string]$_.CommandLine).Substring(0,[Math]::Min(180,([string]$_.CommandLine).Length)) } })
 [pscustomobject]@{ running=($items.Count -gt 0); processes=$items } | ConvertTo-Json -Depth 4 -Compress`;
   try {
     const value = JSON.parse((await runPowerShell(script)).trim() || "{}");
@@ -2023,7 +2616,87 @@ $items=@(Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe'" | Where-Obje
   } catch (error) { throw new Error(`无法检查 Codex 桌面进程：${error.message}`); }
 }
 
+function runWmic(args) {
+  return new Promise((resolve, reject) => execFile("wmic.exe", args, { windowsHide: true, timeout: 8_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+    if (error && !stdout) reject(error); else resolve(String(stdout || ""));
+  }));
+}
+
+function parseWmicList(output) {
+  const records = [];
+  let current = {};
+  for (const raw of String(output || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const equals = line.indexOf("=");
+    if (equals < 0) continue;
+    const key = line.slice(0, equals);
+    const value = line.slice(equals + 1);
+    if (key === "CreationDate" && Object.keys(current).length) { records.push(current); current = {}; }
+    current[key] = value;
+  }
+  if (Object.keys(current).length) records.push(current);
+  return records;
+}
+
+function parseWmicDate(value) {
+  const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{3,6})([+-]\d+)$/.exec(String(value || "").trim());
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, fraction, offset] = match;
+  const millis = Number(fraction.padEnd(3, "0").slice(0, 3));
+  return new Date(Date.UTC(+year, +month - 1, +day, +hour, +minute, +second, millis) - Number(offset) * 60_000).toISOString();
+}
+
+function runTasklist() {
+  return new Promise((resolve, reject) => execFile("tasklist.exe", ["/FI", "IMAGENAME eq ChatGPT.exe", "/NH"], { windowsHide: true, timeout: 10_000, maxBuffer: 512 * 1024 }, (error, stdout) => (error && !stdout ? reject(error) : resolve(String(stdout || "")))));
+}
+
 async function isDesktopRunning() { return (await inspectDesktopProcesses()).running; }
+
+const desktopLifecycleTypes = new Set(["task_started", "task_complete", "turn_aborted", "task_failed"]);
+
+async function readFileTail(file, maxBytes = 1024 * 1024) {
+  const handle = await fsp.open(file, "r");
+  try {
+    const stat = await handle.stat();
+    const length = Math.min(stat.size, maxBytes);
+    if (!length) return "";
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, stat.size - length);
+    return buffer.toString("utf8");
+  } finally { await handle.close(); }
+}
+
+function lifecycleFromLine(line, file, processStartedAt) {
+  if (!line.includes('"event_msg"')) return null;
+  let record;
+  try { record = JSON.parse(line); } catch { return null; }
+  if (record?.type !== "event_msg" || !desktopLifecycleTypes.has(record.payload?.type)) return null;
+  const at = Date.parse(record.timestamp);
+  if (Number.isFinite(processStartedAt) && Number.isFinite(at) && at < processStartedAt - 10_000) return null;
+  return { type: record.payload.type, turnId: record.payload.turn_id, timestamp: record.timestamp, file };
+}
+
+async function readLifecycleTail(file, processStartedAt) {
+  const tail = await readFileTail(file);
+  let lifecycle = null;
+  for (const line of tail.split(/\r?\n/)) {
+    const candidate = lifecycleFromLine(line, file, processStartedAt);
+    if (candidate) lifecycle = candidate;
+  }
+  return lifecycle;
+}
+
+async function readLifecycleFull(file, processStartedAt) {
+  let lifecycle = null;
+  const lines = readline.createInterface({ input: fs.createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.includes('"task_started"') && !line.includes('"task_complete"') && !line.includes('"turn_aborted"') && !line.includes('"task_failed"')) continue;
+    const candidate = lifecycleFromLine(line, file, processStartedAt);
+    if (candidate) lifecycle = candidate;
+  }
+  return lifecycle;
+}
 
 async function inspectDesktopActivity(desktop = null) {
   desktop ||= await inspectDesktopProcesses();
@@ -2045,26 +2718,30 @@ async function inspectDesktopActivity(desktop = null) {
     }
   }
   files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const file of files.slice(0, 12)) {
+  // Only the newest few rollouts can own the current turn. Read a 1MB tail
+  // first; if a long turn has pushed its task_started marker out of that tail,
+  // scan the file without parsing unrelated JSON. Never treat "marker not in
+  // the tail" as idle: that could kill a real running task.
+  for (const file of files.slice(0, 6)) {
     let lifecycle = null;
-    const lines = readline.createInterface({ input: fs.createReadStream(file.target, { encoding: "utf8" }), crlfDelay: Infinity });
-    for await (const line of lines) {
-      let record;
-      try { record = JSON.parse(line); } catch { continue; }
-      if (record?.type !== "event_msg" || !new Set(["task_started", "task_complete"]).has(record.payload?.type)) continue;
-      const at = Date.parse(record.timestamp);
-      if (Number.isFinite(processStartedAt) && Number.isFinite(at) && at < processStartedAt - 10_000) continue;
-      lifecycle = { type: record.payload.type, turnId: record.payload.turn_id, timestamp: record.timestamp, file: file.target };
+    try { lifecycle = await readLifecycleTail(file.target, processStartedAt); } catch { continue; }
+    if (!lifecycle && checkedAt - file.mtimeMs <= desktopActivityFreshMs) {
+      try { lifecycle = await readLifecycleFull(file.target, processStartedAt); } catch { }
     }
     if (lifecycle?.type !== "task_started") continue;
-    const eventAt = Date.parse(lifecycle.timestamp);
-    const fileFresh = checkedAt - file.mtimeMs <= desktopActivityFreshMs;
-    // Older records may not have a timestamp. For those, a fresh append is
-    // enough evidence; otherwise both the event and file must be recent.
-    const eventFresh = !Number.isFinite(eventAt) || checkedAt - eventAt <= desktopActivityFreshMs;
-    if (fileFresh && eventFresh) return { running: true, ...lifecycle, checkedAt, freshnessMs: desktopActivityFreshMs };
+    if (desktopLifecycleIsFresh({ timestamp: lifecycle.timestamp, fileMtimeMs: file.mtimeMs, processStartedAt, checkedAt, freshnessMs: desktopActivityFreshMs })) return { running: true, ...lifecycle, checkedAt, freshnessMs: desktopActivityFreshMs };
   }
   return { running: false, checkedAt, freshnessMs: desktopActivityFreshMs };
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(message), { code: "TAKEOVER_TIMEOUT" })), Math.max(1, timeoutMs));
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 async function closeDesktop(force, immediate = false, initialSnapshot = null) {
@@ -2072,16 +2749,33 @@ async function closeDesktop(force, immediate = false, initialSnapshot = null) {
   let snapshot = initialSnapshot || await inspectDesktopProcesses();
   if (!snapshot.running) return { closed: true, processes: [] };
   if (!immediate) {
+    // A graceful root exit can also close a kill-on-close Job. Guard before
+    // CloseMainWindow, not only before the force fallback.
+    planDesktopTermination({ processes: await readWindowsProcessTable(), desktopProcesses: snapshot.processes });
     setTakeoverState("closing", `正在正常关闭桌面 Codex（${snapshot.processes.length} 个进程）`, snapshot.processes);
     const ids = snapshot.processes.map((item) => Number(item.pid)).filter(Number.isInteger);
     await runPowerShell(`$ids=@(${ids.join(",")}); Get-Process -Id $ids -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowHandle -ne 0} | ForEach-Object {[void]$_.CloseMainWindow()}`);
-    for (let i = 0; i < 16; i++) { await delay(500); snapshot = await inspectDesktopProcesses(); if (!snapshot.running) return { closed: true, processes: [] }; }
+    const graceful = await waitForProcessesExit(ids, { timeoutMs: 8_000, intervalMs: 120 });
+    if (graceful.exited) {
+      const listing = await runTasklist().catch(() => "");
+      if (!/ChatGPT\.exe/i.test(listing)) return { closed: true, processes: [] };
+    }
   }
   if (!force) return { closed: false, processes: snapshot.processes };
   setTakeoverState("killing", `已确认空闲，正在强制结束 ${snapshot.processes.length} 个 Codex 进程`, snapshot.processes);
-  const killIds = snapshot.processes.map((item) => Number(item.pid)).filter(Number.isInteger);
-  if (killIds.length) await runPowerShell(`$ids=@(${killIds.join(",")}); foreach($processId in $ids){ & taskkill.exe /PID $processId /T /F 2>$null | Out-Null }; Get-Process -Id $ids -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0`);
-  for (let i = 0; i < 10; i++) { await delay(400); snapshot = await inspectDesktopProcesses(); if (!snapshot.running) return { closed: true, processes: [] }; }
+  const plan = await terminateDesktopProcesses(snapshot.processes, { onPlan: plan => recordControlAudit('desktop-close-safe-plan', null, { gatewayPid: process.pid, ancestry: plan.ancestry, targetPids: plan.targets.map(p => p.pid) }) });
+  // Poll the exact target PIDs instead of re-reading the whole desktop tree
+  // every 400ms. On this machine each force probe used to cost about 2.4s,
+  // so the old loop could spend 3-4s merely confirming a kill.
+  const targetIds = plan.targets.map((target) => Number(target.pid)).filter(Number.isInteger);
+  const exited = await waitForProcessesExit(targetIds, { timeoutMs: 4_000, intervalMs: 80 });
+  // A quick tasklist catches an auto-restarted desktop without paying for a
+  // full WMI probe. Only an actual ChatGPT.exe triggers the deeper check.
+  const listing = await runTasklist().catch(() => "");
+  if (!/ChatGPT\.exe/i.test(listing)) return { closed: true, processes: [] };
+  if (exited.exited) await delay(150);
+  snapshot = await inspectDesktopProcesses({ force: true });
+  if (!snapshot.running) return { closed: true, processes: [] };
   throw new Error(`仍有 ${snapshot.processes.length} 个 Codex 进程无法关闭`);
 }
 
@@ -2091,8 +2785,12 @@ async function launchDesktop(threadId) {
   await runPowerShell(`Start-Process '${target.replaceAll("'", "''")}'`);
 }
 
-function runPowerShell(script) {
-  return new Promise((resolve, reject) => execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+function runPowerShell(script, { timeout = 25_000 } = {}) {
+  return new Promise((resolve, reject) => execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+    if (!error) { resolve(stdout); return; }
+    const timedOut = error.killed || error.signal === "SIGTERM" || /ETIMEDOUT/.test(String(error.code || ""));
+    reject(new Error(timedOut ? `PowerShell 命令超时（${Math.round(timeout / 1000)} 秒）` : error.message));
+  }));
 }
 
 function runAccountSwitcher(args) {
@@ -2248,7 +2946,79 @@ async function cleanup() {
   if (sessionsChanged) await saveSessions();
   for (const [ip, state] of attempts) if (state.resetAt <= now) attempts.delete(ip);
   for (const [id, item] of uploads) if (item.createdAt < now - 7 * 86400_000) { uploads.delete(id); await fsp.rm(item.path, { force: true }).catch(() => {}); }
+  // The upload index is in-memory only, so a restart forgets every entry and
+  // its files were never reclaimed. Sweep the directory itself as well.
+  const cutoff = now - 7 * 86400_000;
+  const entries = await fsp.readdir(uploadDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const file = path.join(uploadDir, entry.name);
+    try {
+      const stat = await fsp.stat(file);
+      if (stat.mtimeMs < cutoff) await fsp.rm(file, { force: true });
+    } catch { }
+  }
 }
+async function loadOrCreateAccessToken() {
+  try {
+    const saved = await loadJson(accessTokenFile, null);
+    if (saved && typeof saved.token === "string" && saved.token.length >= 32) return saved.token;
+  } catch { }
+  const token = crypto.randomBytes(32).toString("base64url");
+  // Written directly rather than through atomicJson(): this runs before the
+  // module-level state that atomicJson depends on exists.
+  const temp = `${accessTokenFile}.tmp`;
+  await fsp.writeFile(temp, JSON.stringify({ token, createdAt: Date.now() }, null, 2), "utf8");
+  await fsp.rename(temp, accessTokenFile);
+  return token;
+}
+
+function isLoopbackRequest(req) {
+  const address = req.socket?.remoteAddress || "";
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+async function resolveFrpAddress() {
+  try {
+    const module = await import("./src/frp-address.mjs");
+    const resolved = await module.resolvePublicAddress({ localPort: frpLocalPort, dataRoot: frpDataRoot });
+    return resolved && typeof resolved === "object" ? resolved : { ok: false, source: "none", detail: "地址解析返回空结果" };
+  } catch (error) {
+    return { ok: false, url: null, host: null, remotePort: null, serverAddr: null, tunnelName: null, instanceId: null, source: "none", detail: `地址解析模块不可用：${error.message}` };
+  }
+}
+
+// Never create or rewrite the launcher settings unless the DPAPI-protected
+// password blob is present: the tray cannot start the gateway without it.
+async function writeLauncherPublicUrl(url) {
+  let settings = null;
+  try { settings = JSON.parse(await fsp.readFile(launcherSettingsFile, "utf8")); } catch { return false; }
+  if (!settings || typeof settings !== "object" || typeof settings.ProtectedPassword !== "string" || settings.ProtectedPassword.length < 16) return false;
+  if (settings.PublicUrl === url) return false;
+  settings.PublicUrl = url;
+  await fsp.mkdir(path.dirname(launcherSettingsFile), { recursive: true });
+  const temp = `${launcherSettingsFile}.server.tmp`;
+  await fsp.writeFile(temp, JSON.stringify(settings, null, 2), "utf8");
+  await fsp.rename(temp, launcherSettingsFile);
+  return true;
+}
+
+async function refreshPublicAddress({ force = false } = {}) {
+  const info = await resolveFrpAddress();
+  publicAddress = info;
+  if (!info.ok || !info.url) return info;
+  const link = `${info.url}/?t=${accessToken}`;
+  if (!force && link === publicAddressSyncedUrl) return info;
+  try {
+    const written = await writeLauncherPublicUrl(link);
+    publicAddressSyncedUrl = link;
+    if (written) console.log(`Codex Web Remote public address synced: ${info.url} (${info.source})`);
+  } catch (error) {
+    console.error(`public address sync failed: ${error.message}`);
+  }
+  return info;
+}
+
 function loadEnvFile(file) {
   if (!fs.existsSync(file)) return;
   for (const raw of fs.readFileSync(file, "utf8").split(/\r?\n/)) {

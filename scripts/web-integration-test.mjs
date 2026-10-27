@@ -3,12 +3,15 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
+import net from 'node:net';
 
 const root = path.resolve(import.meta.dirname, "..");
 const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-web-integration-"));
-const port = 18992;
+const freePort = async () => { const probe = net.createServer(); await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve); }); const value = probe.address().port; await new Promise(resolve => probe.close(resolve)); return value; };
+const port = Number(process.env.CODEX_WEB_INTEGRATION_PORT) || await freePort();
 const base = `http://127.0.0.1:${port}`;
 const password = "integration-test-only";
+const testModel = String(process.env.CODEX_WEB_TEST_MODEL || "").trim();
 const desktopStateFile = path.join(temp, "desktop-state.json");
 const desktopSessionsRoot = path.join(temp, "desktop-sessions");
 const desktopThreadId = "01234567-89ab-4cde-8fab-0123456789ab";
@@ -62,8 +65,10 @@ const waitFor = async (check, timeoutMs = 180_000) => {
 
 const startServer = async () => {
   const processHandle = spawn(process.execPath, ["server.mjs"], { cwd: root, env: serverEnv, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  let listening = false;
+  processHandle.stdout.on('data', chunk => { if (String(chunk).includes(`http://127.0.0.1:${port}`)) listening = true; });
   processHandle.stderr.on("data", (chunk) => { stderr += String(chunk); });
-  await waitFor(async () => fetch(`${base}/api/session`).then((response) => response.ok).catch(() => false), 15_000);
+  await waitFor(async () => { if (processHandle.exitCode != null) throw new Error(`Test gateway exited before listen: ${stderr.slice(-1500)}`); return listening && fetch(`${base}/api/session`).then((response) => response.ok).catch(() => false); }, 15_000);
   return processHandle;
 };
 
@@ -116,6 +121,12 @@ try {
     try {
       const event = JSON.parse(String(raw));
       desktopEvents.push(event.type);
+      if (event.type === 'threadChanged' && event.data?.threadId === desktopThreadId) {
+        // v2 sends an invalidation, not the entire growing rollout over WS.
+        void request(`/api/v2/threads/${desktopThreadId}/view?limit=60`).then((page) => {
+          desktopLiveOutput += JSON.stringify(page.thread || {});
+        }).catch(() => {});
+      }
       if (event.type === "desktopLive" && event.data?.threadId === desktopThreadId) {
         if (event.data.kind === "agent") desktopLiveOutput += event.data.delta || "";
         if (event.data.kind === "snapshot") desktopLiveOutput += JSON.stringify(event.data.thread || {});
@@ -210,9 +221,9 @@ try {
     if (!/failed to fetch codex rate limits|error sending request|account authentication required/i.test(error.message)) throw error;
     accountUsageVerified = false;
   }
-  const created = await request("/api/threads", { method: "POST", body: { cwd: root } });
+  const created = await request("/api/threads", { method: "POST", body: { cwd: root, ...(testModel ? { model: testModel } : {}) } });
   const threadId = created.thread.id;
-  const removable = await request("/api/threads", { method: "POST", body: { cwd: root } });
+  const removable = await request("/api/threads", { method: "POST", body: { cwd: root, ...(testModel ? { model: testModel } : {}) } });
   await request(`/api/threads/${removable.thread.id}`, { method: "DELETE", body: {} });
   const afterDelete = await request("/api/threads");
   if (afterDelete.data?.some((thread) => thread.id === removable.thread.id)) throw new Error("A Desktop-deleted task remained in the Web task list");
@@ -257,8 +268,8 @@ try {
     } catch { }
   });
   const [primarySubmission, secondarySubmission] = await Promise.all([
-    request(`/api/threads/${threadId}/messages`, { method: "POST", sessionCookie: primaryCookie, body: { text: "Run a shell command that prints TIMELINE_COMMAND_OK, then reply with exactly QUEUE_FIRST_OK.", mode: "auto", effort: "low", summary: "detailed" } }),
-    request(`/api/threads/${threadId}/messages`, { method: "POST", sessionCookie: secondaryCookie, body: { text: "Reply with exactly QUEUE_SECOND_OK.", mode: "auto" } }),
+    request(`/api/threads/${threadId}/messages`, { method: "POST", sessionCookie: primaryCookie, body: { text: "Run a shell command that prints TIMELINE_COMMAND_OK, then reply with exactly QUEUE_FIRST_OK.", mode: "auto", effort: "low", summary: "detailed", ...(testModel ? { model: testModel } : {}) } }),
+    request(`/api/threads/${threadId}/messages`, { method: "POST", sessionCookie: secondaryCookie, body: { text: "Reply with exactly QUEUE_SECOND_OK.", mode: "auto", ...(testModel ? { model: testModel } : {}) } }),
   ]);
   if (Number(Boolean(primarySubmission.queued)) + Number(Boolean(secondarySubmission.queued)) !== 1) {
     throw new Error(`Concurrent Web submissions were not serialized: ${JSON.stringify({ primarySubmission, secondarySubmission })}`);
@@ -266,6 +277,9 @@ try {
   await waitFor(async () => {
     const status = await request("/api/control/status");
     return completedCount >= 2 && !status.activeTurns?.[threadId] && !status.queuedByThread?.[threadId];
+  }).catch(async (error) => {
+    const status = await request('/api/control/status');
+    throw new Error(`${error.message}; completed=${completedCount}; turns=${JSON.stringify(completedTurns.map(t => ({ status: t.status, error: t.error })))}; active=${JSON.stringify(status.activeTurns)}; queue=${JSON.stringify(status.queuedByThread)}; reply=${replyText.slice(-500)}; backend=${stderr.slice(-3000)}`);
   });
   const failedTurns = completedTurns.filter((turn) => turn?.status === "failed");
   if (failedTurns.length) throw new Error(`Turns failed: ${JSON.stringify(failedTurns.map((turn) => turn.error))}`);

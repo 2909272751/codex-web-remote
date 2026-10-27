@@ -1,5 +1,5 @@
-const CACHE = "codex-web-remote-v2.0.3-busyfix1";
-const SHELL = ["/", "/styles.css", "/layout-fix.css", "/modern-ui.css", "/app.js", "/reasoning-state.js", "/timeline.js", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "codex-web-remote-v2.1.0-task-list-fix2";
+const SHELL = ["/", "/styles.css", "/layout-fix.css", "/modern-ui.css", "/experience.css", "/app.js", "/project-utils.js", "/markdown.js", "/workspace-cache.js", "/reasoning-state.js", "/timeline.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));

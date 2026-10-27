@@ -28,6 +28,23 @@ try {
     Remove-Item Env:CODEX_WEB_STATE_ROOT, Env:CODEX_WEB_SELF_TEST_PORT -ErrorAction SilentlyContinue
 }
 
+# Regression: an overwrite install WITHOUT /DIR must reuse the directory of the
+# installation that is already registered, never the DefaultDirName fallback.
+# A missing uninstall entry used to make Inno treat the upgrade as a fresh
+# install and silently create a second instance. Runs before the uninstall so
+# the QA install is still the registered one (this stays inside the QA root).
+$defaultDir = Join-Path $env:LOCALAPPDATA "Programs\CodexWebRemote"
+$defaultDirExistedBefore = Test-Path -LiteralPath $defaultDir
+$reinstallLog = Join-Path $qaRoot "reinstall.log"
+$reinstallArgs = @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/QA=1", "/LOG=$reinstallLog")
+$reinstall = Start-Process -FilePath $SetupPath -ArgumentList $reinstallArgs -WindowStyle Hidden -PassThru -Wait
+$reusedDir = $null
+if (Test-Path -LiteralPath $reinstallLog) {
+    $match = Select-String -LiteralPath $reinstallLog -Pattern 'Dest filename: (.+?)\\CodexWebRemote\.exe' | Select-Object -First 1
+    if ($match) { $reusedDir = $match.Matches[0].Groups[1].Value }
+}
+$secondInstanceCreated = (-not $defaultDirExistedBefore) -and (Test-Path -LiteralPath $defaultDir)
+
 $uninstaller = Start-Process -FilePath (Join-Path $install "unins000.exe") -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -WindowStyle Hidden -PassThru -Wait
 if ($uninstaller.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstaller.ExitCode)" }
 Start-Sleep -Seconds 2
@@ -44,4 +61,8 @@ $runAfter = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\R
     TaskBefore = $taskBefore
     TaskAfter = $taskAfter
     AutoStartPreserved = $runBefore -eq $runAfter
+    ReinstallExit = $reinstall.ExitCode
+    ReinstallReusedDir = $reusedDir
+    ReinstallReusedQaDir = [bool]($reusedDir -and ($reusedDir.TrimEnd('\') -ieq $install.TrimEnd('\')))
+    SecondInstanceCreated = $secondInstanceCreated
 }

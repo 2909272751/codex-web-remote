@@ -8,8 +8,11 @@ const port = 18998;
 const base = `http://127.0.0.1:${port}`;
 const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-web-projects-"));
 const dataDir = path.join(tempRoot, "data");
+const userProfile = path.join(tempRoot, "user");
+const codexHome = path.join(userProfile, ".codex");
 const projectPath = path.join(tempRoot, "示例项目");
 await fsp.mkdir(projectPath, { recursive: true });
+await fsp.mkdir(codexHome, { recursive: true });
 let cookie = "";
 let stderr = "";
 
@@ -19,6 +22,8 @@ const serverEnv = {
   CODEX_WEB_HOST: "127.0.0.1",
   CODEX_WEB_PORT: String(port),
   CODEX_WEB_DATA_DIR: dataDir,
+  USERPROFILE: userProfile,
+  CODEX_HOME: codexHome,
   CODEX_WEB_TEST_MODE: "1",
 };
 

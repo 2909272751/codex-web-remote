@@ -1,6 +1,26 @@
 const OUTPUT_LIMIT = 500_000;
 
 export function timelineItemNode(item = {}, { lazy = false } = {}) {
+  if (item.detailUrl) {
+    const { detailUrl, ...preview } = item;
+    const card = timelineItemNode(preview, { lazy: false });
+    if (!card) return null;
+    let loaded = false; let loading = false;
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'timeline-load-detail'; button.textContent = '查看完整内容';
+    const load = async () => {
+      if (loaded || loading) return; loading = true; button.disabled = true; button.textContent = '正在读取…';
+      try {
+        const url = new URL(detailUrl, location.href); if (url.origin !== location.origin || !url.pathname.startsWith('/api/v2/threads/')) throw new Error('无效详情地址');
+        const response = await fetch(url, { credentials: 'same-origin' }); if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json(); const full = timelineItemNode(result.item, { lazy: false });
+        if (full) { card.querySelector('.timeline-body').replaceChildren(...full.querySelector('.timeline-body').childNodes); loaded = true; }
+      } catch (error) { button.disabled = false; button.textContent = `读取失败，点击重试（${error.message}）`; }
+      finally { loading = false; }
+    };
+    button.onclick = load; card.querySelector('.timeline-body').append(button);
+    card.addEventListener('toggle', () => { if (card.open) load(); });
+    return card;
+  }
   switch (item.type) {
     case "plan": return planItem(item);
     case "commandExecution": return commandItem(item, { lazy });
@@ -8,7 +28,7 @@ export function timelineItemNode(item = {}, { lazy = false } = {}) {
     case "mcpToolCall": return mcpToolItem(item, { lazy });
     case "dynamicToolCall": return dynamicToolItem(item, { lazy });
     case "collabAgentToolCall": return collabItem(item);
-    case "subAgentActivity": return simpleItem(item, "agents", "子代理活动", `${item.agentPath || item.agentThreadId || "子代理"} · ${item.kind || "处理中"}`);
+    case "subAgentActivity": return subAgentItem(item);
     case "webSearch": return webSearchItem(item);
     case "imageView": return simpleItem(item, "image", "查看图片", item.path || "图片");
     case "sleep": return simpleItem(item, "wait", "等待", `${Math.max(0, Number(item.durationMs || 0))} 毫秒`);
@@ -135,6 +155,15 @@ function mcpToolItem(item, { lazy = false } = {}) {
 
 function dynamicToolItem(item, { lazy = false } = {}) {
   const title = [item.namespace, item.tool].filter(Boolean).join(".") || "客户端工具";
+  const status = item.status || "completed";
+  const internalName = title.toLowerCase();
+  const internalDesktopTool = String(item.namespace || "").toLowerCase() === "desktop"
+    || internalName.startsWith("desktop.")
+    || ["exec_command", "write_stdin"].includes(internalName);
+  // The Desktop App hides completed internal transport tools such as
+  // desktop.exec_command / desktop.write_stdin. Keep running and failed calls
+  // visible so the user can still see what is happening and what broke.
+  if (internalDesktopTool && (status === "completed" || status === "succeeded")) return null;
   const node = baseCard({ kind: "tool", icon: "◇", title, subtitle: "动态工具调用", status: item.status, open: item.status === "inProgress" });
   populateBody(node, lazy, (body) => {
     body.append(section("参数", codeBlock(pretty(item.arguments))));
@@ -150,7 +179,23 @@ function collabItem(item) {
   if (item.prompt) body.append(section("任务", textBlock(item.prompt)));
   const agents = Object.entries(item.agentsStates || {}).map(([id, value]) => `${id}：${value?.status || pretty(value)}`);
   if (agents.length) body.append(section("代理状态", codeBlock(agents.join("\n"))));
+  appendAgentLinks(body, [item.agentThreadId, ...(item.receiverThreadIds || []), ...Object.keys(item.agentsStates || {})]);
+  for (const value of Object.values(item.agentsStates || {})) if (value?.message || value?.result) body.append(section('最新返回', textBlock(String(value.message || value.result))));
   return node;
+}
+function subAgentItem(item) {
+  const kind = String(item.kind || '').toLowerCase();
+  const status = item.status || (/start|running|spawn/.test(kind) ? 'inProgress' : /complete|done|finish/.test(kind) ? 'completed' : /fail|error/.test(kind) ? 'failed' : 'pending');
+  const node = baseCard({ kind: 'agents', icon: '◎', title: item.agentPath || item.name || '子智能体', subtitle: [item.model, item.kind].filter(Boolean).join(' · '), status, open: status === 'inProgress' });
+  const body = node.querySelector('.timeline-body');
+  if (item.prompt || item.task) body.append(section('任务', textBlock(item.prompt || item.task)));
+  if (item.text || item.message || item.result) body.append(section('最新内容', textBlock(item.text || item.message || String(item.result))));
+  appendAgentLinks(body, [item.agentThreadId, item.threadId]);
+  if (!body.children.length) body.append(textBlock('执行端已报告活动，详细内容尚未保存。'));
+  return node;
+}
+function appendAgentLinks(body, ids) {
+  for (const id of [...new Set(ids.filter(Boolean))]) { const button = document.createElement('button'); button.type = 'button'; button.className = 'timeline-load-detail'; button.dataset.agentThread = String(id); button.textContent = `查看子任务 ${String(id).slice(0, 12)} →`; body.append(button); }
 }
 
 function webSearchItem(item) {
@@ -245,7 +290,7 @@ function planOverallStatus(plan = []) { return plan.some((item) => item.status =
 function statusClass(status) { return String(status || "completed").replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`); }
 function statusText(status) { return ({ inProgress: "\u8fd0\u884c\u4e2d", completed: "\u5b8c\u6210", failed: "\u5931\u8d25", declined: "\u5df2\u62d2\u7edd", pending: "\u5f85\u5904\u7406" })[status] || String(status || "\u5b8c\u6210"); }
 function formatDuration(ms) { const value = Number(ms || 0); return value < 1_000 ? `${value}ms` : `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}s`; }
-function compact(value) { return String(value || "").replace(/s+/g, " ").trim().slice(0, 180); }
+function compact(value) { return String(value || "").replace(/\s+/g, " ").trim().slice(0, 180); }
 function cappedAppend(current, delta) { const joined = `${current || ""}${delta || ""}`; return joined.length > OUTPUT_LIMIT ? `\u2026\u8f83\u65e9\u8f93\u51fa\u5df2\u6298\u53e0\u2026\n${joined.slice(-OUTPUT_LIMIT)}` : joined; }
 function updateOutputOverflow(output) {
   const text = String(output?.textContent || "");

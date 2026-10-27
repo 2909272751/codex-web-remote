@@ -325,6 +325,15 @@ input:-webkit-autofill:focus {
 .reasoning-content {
   color: color-mix(in srgb, var(--ui-text) 82%, var(--ui-muted));
 }
+.reasoning > summary {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  padding: 2px 0;
+}
+@media (max-width: 720px) {
+  .reasoning > summary { min-height: 36px; }
+}
 .timeline-status,
 .file-kind,
 .thread-queue {
@@ -613,4 +622,44 @@ input:-webkit-autofill:focus {
   .permission-shortcut {
     max-width: 30vw;
   }
+}
+.thread-action-menu {
+  position: fixed;
+  z-index: 80;
+  display: grid;
+  min-width: 156px;
+  gap: 2px;
+  padding: 6px;
+  border: 1px solid var(--ui-line);
+  border-radius: 12px;
+  background: var(--ui-elevated);
+  box-shadow: 0 16px 44px rgba(25, 18, 55, .2);
+  animation: menu-in .14s ease both;
+}
+.thread-action-menu button {
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ui-text);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+.thread-action-menu button:hover,
+.thread-action-menu button:focus-visible {
+  background: color-mix(in srgb, var(--ui-accent) 10%, var(--ui-surface));
+  color: var(--ui-accent);
+}
+.thread-action-menu button.danger { color: var(--ui-danger); }
+.thread-action-menu button.danger:hover,
+.thread-action-menu button.danger:focus-visible {
+  background: color-mix(in srgb, var(--ui-danger) 10%, var(--ui-surface));
+  color: var(--ui-danger);
+}
+.thread-action-menu button:disabled { opacity: .42; cursor: not-allowed; }
+@keyframes menu-in {
+  from { opacity: 0; transform: translateY(-4px) scale(.98); }
+  to { opacity: 1; transform: none; }
 }
